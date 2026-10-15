@@ -79,7 +79,7 @@ class CameraConfig(BaseModel):
     far: float = 100.0
     # Small objects (products, signs) are drawn only within this many metres, and this share of
     # the scene's triangles is simplified away: tens of millions of vertices are too many for a
-    # software GPU (e.g. Docker's lavapipe). None is 8 m and no simplifying on a real GPU,
+    # software GPU (e.g. Docker's lavapipe). None draws everything, exactly, on a real GPU, and
     # 4 m and 0.95 on a software one.
     detail_distance: float | None = None
     simplify: float | None = None

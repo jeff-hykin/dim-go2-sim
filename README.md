@@ -62,8 +62,8 @@ See `src/dim_go2_sim/config.py` for what each means and its default.
   static scene is cast through Embree; the robot's own body, through MuJoCo. A cooked store of
   48k geoms scans at the full 10 Hz.
 - **Camera.** pygfx draws the scene's textured glTF in a child process, its meshes merged by
-  material and 4 m cell so far ones can be skipped (a 47k-node store: 0.6 → 60+ fps on an
-  M-series Mac). It draws the scene only, not the robot. On a software GPU (Mesa's lavapipe,
+  material and 4 m cell (a 47k-node store: 0.6 → 60+ fps on an M-series Mac, every object
+  drawn). It draws the scene only, not the robot. On a software GPU (Mesa's lavapipe,
   e.g. in Docker: install `mesa-vulkan-drivers`) it simplifies the scene and draws small objects
   only within 4 m, to keep a store at several frames a second (`camera.simplify`,
   `camera.detail_distance`).

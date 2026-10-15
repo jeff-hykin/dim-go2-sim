@@ -39,8 +39,9 @@ MAX_VERTICES = 2_000_000
 # Triangles simplified away on a software GPU (e.g. lavapipe in Docker), and the fewest a merged
 # mesh needs before it is simplified at all.
 SOFTWARE_REDUCTION = 0.95
-# How near small objects must be to be drawn, metres, on a real and on a software GPU.
-DETAIL_DISTANCE, SOFTWARE_DETAIL_DISTANCE = 8.0, 4.0
+# How near small objects must be to be drawn, metres, on a real GPU (all of them: the image is
+# exact) and on a software one.
+DETAIL_DISTANCE, SOFTWARE_DETAIL_DISTANCE = math.inf, 4.0
 MIN_SIMPLIFY_TRIANGLES = 200
 # Merged meshes are cut into square cells this wide, metres, so far ones can be skipped.
 CHUNK_CELL = 4.0
@@ -94,8 +95,8 @@ class _Renderer:
     def capture(
         self, position: NDArray[np.float64], forward: NDArray[np.float64], up: NDArray[np.float64]
     ) -> NDArray[np.uint8]:
-        # Draw only chunks within reach and not wholly behind the camera: a store's products,
-        # tens of millions of vertices, are too many for a software GPU to draw every frame.
+        # Skip chunks wholly behind the camera, which can't change the image; on a software GPU
+        # also small ones out of reach, as a store's tens of millions of vertices are too many.
         offset = self._centers - position
         distance = np.linalg.norm(offset, axis=1) - self._extents
         visible = (distance < self._reach) & (offset @ forward > -self._extents)
