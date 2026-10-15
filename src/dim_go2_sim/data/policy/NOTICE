@@ -1,0 +1,12 @@
+Unitree Go2 velocity-tracking locomotion policy.
+
+Source: rl_sar, https://github.com/fan-ziqi/rl_sar
+        policy/go2/robot_lab/policy.pt at commit 376d42c9b128f963ab08579762d5a216a976ce39
+        (trained with robot_lab, https://github.com/fan-ziqi/robot_lab)
+Copyright (c) 2024-2025 Ziqi Fan
+License: Apache-2.0 (see LICENSE)
+
+policy.onnx is the TorchScript actor exported with torch.onnx.export (opset 17),
+input "obs" (1, 45) float32, output "actions" (1, 12) float32.
+config.yaml and base.yaml are the source's deployment configs that define the
+observation layout, scales, default joint positions, PD gains and joint order.

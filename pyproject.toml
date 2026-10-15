@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dim-go2-sim"
+version = "0.1.0"
+description = "A simulated Unitree Go2 for dimOS: cmd_vel in; Mid-360 lidar, textured camera, IMU, odometry and contacts out"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "src/dim_go2_sim/data/go2/LICENSE", "src/dim_go2_sim/data/policy/LICENSE"]
+requires-python = ">=3.10,<3.13"
+authors = [{ name = "Jeff Hykin", email = "jeff.hykin@gmail.com" }]
+dependencies = [
+    "dimos>=0.0.14",
+    "mujoco>=3.3.4",
+    "numpy>=1.26",
+    "scipy>=1.15",
+    "open3d>=0.18; platform_system != 'Linux' or platform_machine != 'aarch64'",
+    "onnxruntime>=1.17",
+    "pygfx>=0.17,<0.18",
+    "gltflib>=1.0.13",
+    "imageio>=2.30",  # glTF textures
+    "rendercanvas>=2.0",
+]
+
+[project.urls]
+Repository = "https://github.com/jeff-hykin/dim-go2-sim"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dim_go2_sim"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["dim_go2_sim"]
