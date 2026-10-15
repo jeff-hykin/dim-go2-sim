@@ -21,6 +21,7 @@ process, since GPU device state cannot cross dimOS's forkserver.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import math
 import pickle
@@ -33,6 +34,18 @@ from numpy.typing import NDArray
 
 from dim_go2_sim.config import CameraConfig
 
+# Most vertices in one merged mesh: 12 bytes each keeps a buffer far under 128 MB.
+MAX_VERTICES = 2_000_000
+# Triangles simplified away on a software GPU (e.g. lavapipe in Docker), and the fewest a merged
+# mesh needs before it is simplified at all.
+SOFTWARE_REDUCTION = 0.95
+# How near small objects must be to be drawn, metres, on a real and on a software GPU.
+DETAIL_DISTANCE, SOFTWARE_DETAIL_DISTANCE = 8.0, 4.0
+MIN_SIMPLIFY_TRIANGLES = 200
+# Merged meshes are cut into square cells this wide, metres, so far ones can be skipped.
+CHUNK_CELL = 4.0
+# Objects smaller than this bounding radius, metres, are detail (products, signs).
+SMALL_RADIUS = 0.3
 # glTF is Y-up; the world is Z-up.
 Y_UP_TO_Z_UP = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=np.float64)
 
@@ -50,9 +63,21 @@ class _Renderer:
         root.add(gfx.load_gltf(visual, quiet=True, remote_ok=False).scene)
         if y_up:
             root.local.matrix = Y_UP_TO_Z_UP
+        self._config = config
+        software = gfx.renderers.wgpu.get_shared().adapter.info["adapter_type"] == "CPU"
+        reduction = config.simplify
+        if reduction is None:
+            reduction = SOFTWARE_REDUCTION if software else 0.0
+        detail = config.detail_distance
+        if detail is None:
+            detail = SOFTWARE_DETAIL_DISTANCE if software else DETAIL_DISTANCE
+        self._chunks = _chunks(gfx, root, reduction)
+        self._centers = np.array([c.center for c in self._chunks]).reshape(-1, 3)
+        self._extents = np.array([c.extent for c in self._chunks])
+        self._reach = np.array([detail if c.small else config.far for c in self._chunks])
         self._scene = gfx.Scene()
         background = gfx.Background(None, gfx.BackgroundMaterial(config.background))
-        self._scene.add(background, _merged(gfx, root))
+        self._scene.add(background, *[c.mesh for c in self._chunks])
         self._scene.add(gfx.AmbientLight("#ffffff", config.ambient))
         sun = gfx.DirectionalLight("#fff4e6", config.sun)
         sun.local.position = (4.0, -6.0, 10.0)
@@ -69,6 +94,13 @@ class _Renderer:
     def capture(
         self, position: NDArray[np.float64], forward: NDArray[np.float64], up: NDArray[np.float64]
     ) -> NDArray[np.uint8]:
+        # Draw only chunks within reach and not wholly behind the camera: a store's products,
+        # tens of millions of vertices, are too many for a software GPU to draw every frame.
+        offset = self._centers - position
+        distance = np.linalg.norm(offset, axis=1) - self._extents
+        visible = (distance < self._reach) & (offset @ forward > -self._extents)
+        for chunk, show in zip(self._chunks, visible, strict=True):
+            chunk.mesh.visible = bool(show)
         self._camera.world.position = tuple(position)
         self._camera.world.reference_up = tuple(up)
         self._camera.look_at(tuple(position + forward))
@@ -77,43 +109,108 @@ class _Renderer:
         return np.ascontiguousarray(np.asarray(self._renderer.snapshot())[:, :, :3])
 
 
-def _merged(gfx: Any, root: Any) -> Any:
-    """One mesh per material, in world coordinates: a store is ~47k nodes, one draw call each."""
+def _simplified(attributes: dict[str, NDArray[Any]], reduction: float) -> dict[str, NDArray[Any]]:
+    """Quadric decimation; each kept vertex takes the normal and UV of the nearest original."""
+    import fast_simplification  # type: ignore[import-untyped]
+    from scipy.spatial import cKDTree
+
+    positions = attributes["positions"].astype(np.float64)
+    points, faces = fast_simplification.simplify(
+        positions, attributes["indices"].astype(np.int64), target_reduction=reduction
+    )
+    nearest = cKDTree(positions).query(points)[1]
+    result = {
+        "positions": points.astype(np.float32),
+        "indices": faces.astype(np.uint32).reshape(-1, 3),
+    }
+    for name in ("normals", "texcoords"):
+        if name in attributes:
+            result[name] = attributes[name][nearest]
+    return result
+
+
+@dataclass
+class _Chunk:
+    mesh: Any
+    center: NDArray[np.float64]
+    extent: float  # bounding radius about center
+    small: bool  # made of small objects, drawn only near the camera
+
+
+def _chunks(gfx: Any, root: Any, reduction: float) -> list[_Chunk]:
+    """The scene's meshes merged by material, CHUNK_CELL cell, and size, in world coordinates.
+
+    A store is ~47k nodes, one draw call each; merged, it is a few thousand chunks that can be
+    culled by distance. Each stays under MAX_VERTICES, as GPUs cap a buffer (lavapipe: 128 MB).
+    With reduction > 0, that share of each chunk's triangles is simplified away.
+    """
     meshes: list[Any] = []
     root.traverse(lambda node: meshes.append(node) if isinstance(node, gfx.Mesh) else None)
-    by_material: dict[int, list[Any]] = {}
+    groups: dict[tuple[int, int, int, bool], list[tuple[Any, NDArray[np.float64]]]] = {}
     for mesh in meshes:
-        by_material.setdefault(id(mesh.material), []).append(mesh)
-    group = gfx.Group()
-    for same in by_material.values():
-        positions, normals, texcoords, indices, offset = [], [], [], [], 0
-        for mesh in same:
-            geometry, matrix = mesh.geometry, mesh.world.matrix
-            local = geometry.positions.data.reshape(-1, 3).astype(np.float64)
-            positions.append((local @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32))
-            normal = getattr(geometry, "normals", None)
-            if normal is not None:
-                rotated = normal.data.reshape(-1, 3) @ np.linalg.inv(matrix[:3, :3])
-                rotated /= np.maximum(np.linalg.norm(rotated, axis=1, keepdims=True), 1e-12)
-                normals.append(rotated.astype(np.float32))
-            uv = getattr(geometry, "texcoords", None)
-            if uv is not None:
-                texcoords.append(uv.data.reshape(-1, 2).astype(np.float32))
-            index = getattr(geometry, "indices", None)
-            index = np.arange(len(local)) if index is None else index.data.reshape(-1)
-            indices.append(index.astype(np.uint32) + offset)
-            offset += len(local)
-        attributes: dict[str, NDArray[Any]] = {
-            "positions": np.concatenate(positions),
-            "indices": np.concatenate(indices).reshape(-1, 3),
-        }
-        # A partial attribute can't be merged; drop it rather than misalign vertices.
-        if len(normals) == len(same):
-            attributes["normals"] = np.concatenate(normals)
-        if len(texcoords) == len(same):
-            attributes["texcoords"] = np.concatenate(texcoords)
-        group.add(gfx.Mesh(gfx.Geometry(**attributes), same[0].material))
-    return group
+        matrix = mesh.world.matrix
+        local = mesh.geometry.positions.data.reshape(-1, 3).astype(np.float64)
+        world = local @ matrix[:3, :3].T + matrix[:3, 3]
+        low, high = world.min(axis=0), world.max(axis=0)
+        center = (low + high) / 2
+        small = float(np.linalg.norm(high - low)) / 2 < SMALL_RADIUS
+        cell = np.floor(center[:2] / CHUNK_CELL).astype(int)
+        key = (id(mesh.material), int(cell[0]), int(cell[1]), small)
+        groups.setdefault(key, []).append((mesh, world))
+    chunks: list[_Chunk] = []
+    for key, members in groups.items():
+        batch: list[tuple[Any, NDArray[np.float64]]] = []
+        count = 0
+        for member in members:
+            if batch and count + len(member[1]) > MAX_VERTICES:
+                chunks.append(_merge(gfx, batch, key[3], reduction))
+                batch, count = [], 0
+            batch.append(member)
+            count += len(member[1])
+        chunks.append(_merge(gfx, batch, key[3], reduction))
+    return chunks
+
+
+def _merge(
+    gfx: Any, members: list[tuple[Any, NDArray[np.float64]]], small: bool, reduction: float
+) -> _Chunk:
+    """One mesh of meshes that share a material, given their world-frame vertices."""
+    positions, normals, texcoords, indices, offset = [], [], [], [], 0
+    for mesh, world in members:
+        geometry, matrix = mesh.geometry, mesh.world.matrix
+        positions.append(world.astype(np.float32))
+        normal = getattr(geometry, "normals", None)
+        if normal is not None:
+            rotated = normal.data.reshape(-1, 3) @ np.linalg.inv(matrix[:3, :3])
+            rotated /= np.maximum(np.linalg.norm(rotated, axis=1, keepdims=True), 1e-12)
+            normals.append(rotated.astype(np.float32))
+        uv = getattr(geometry, "texcoords", None)
+        if uv is not None:
+            texcoords.append(uv.data.reshape(-1, 2).astype(np.float32))
+        index = getattr(geometry, "indices", None)
+        index = np.arange(len(world)) if index is None else index.data.reshape(-1)
+        indices.append(index.astype(np.uint32) + offset)
+        offset += len(world)
+    vertices = np.concatenate(positions)
+    attributes: dict[str, NDArray[Any]] = {
+        "positions": vertices,
+        "indices": np.concatenate(indices).reshape(-1, 3),
+    }
+    # A partial attribute can't be merged; drop it rather than misalign vertices.
+    if len(normals) == len(members):
+        attributes["normals"] = np.concatenate(normals)
+    if len(texcoords) == len(members):
+        attributes["texcoords"] = np.concatenate(texcoords)
+    if reduction > 0 and len(attributes["indices"]) >= MIN_SIMPLIFY_TRIANGLES:
+        attributes = _simplified(attributes, reduction)
+        vertices = attributes["positions"]
+    low, high = vertices.min(axis=0).astype(np.float64), vertices.max(axis=0).astype(np.float64)
+    return _Chunk(
+        mesh=gfx.Mesh(gfx.Geometry(**attributes), members[0][0].material),
+        center=(low + high) / 2,
+        extent=float(np.linalg.norm(high - low)) / 2,
+        small=small,
+    )
 
 
 def _serve(visual: str, y_up: bool, config: CameraConfig) -> None:

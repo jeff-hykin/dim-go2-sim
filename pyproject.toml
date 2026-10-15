@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dim-go2-sim"
-version = "0.1.0"
+version = "0.1.1"
 description = "A simulated Unitree Go2 for dimOS: cmd_vel in; Mid-360 lidar, textured camera, IMU, odometry and contacts out"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,6 +21,7 @@ dependencies = [
     "pygfx>=0.17,<0.18",
     "gltflib>=1.0.13",
     "imageio>=2.30",  # glTF textures
+    "fast-simplification>=0.1.7",
     "rendercanvas>=2.0",
 ]
 

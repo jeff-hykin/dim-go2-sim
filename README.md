@@ -45,7 +45,7 @@ textured glTF the camera draws (`scene.visual`).
 - `lidar`: `enabled`, `rate_hz`, `xyz`, `pitch_deg`, `point_rate_hz`, `downsample`,
   `min_range`, `max_range`, `noise`, `dropout`, `self_occlusion`, `motion_bins_hz`, `seed`
 - `camera`: `enabled`, `rate_hz`, `width`, `height`, `fovy_deg`, `xyz`, `pitch_deg`, `near`,
-  `far`, `ambient`, `sun`, `background`
+  `far`, `detail_distance`, `simplify`, `ambient`, `sun`, `background`
 - `odom_hz`, `imu_hz`, `frame_prefix`
 
 See `src/dim_go2_sim/config.py` for what each means and its default.
@@ -61,10 +61,12 @@ See `src/dim_go2_sim/config.py` for what each means and its default.
   5 ms slices from wherever the head is then, with range noise and grazing-angle dropout. The
   static scene is cast through Embree; the robot's own body, through MuJoCo. A cooked store of
   48k geoms scans at the full 10 Hz.
-- **Camera.** pygfx draws the scene's textured glTF in a child process, its meshes merged per
-  material (a 47k-node store: 0.6 → 80+ fps on an M-series Mac). It draws the scene only, not
-  the robot. Without a GPU (e.g. Docker), it runs on Mesa's lavapipe: install
-  `mesa-vulkan-drivers`.
+- **Camera.** pygfx draws the scene's textured glTF in a child process, its meshes merged by
+  material and 4 m cell so far ones can be skipped (a 47k-node store: 0.6 → 60+ fps on an
+  M-series Mac). It draws the scene only, not the robot. On a software GPU (Mesa's lavapipe,
+  e.g. in Docker: install `mesa-vulkan-drivers`) it simplifies the scene and draws small objects
+  only within 4 m, to keep a store at several frames a second (`camera.simplify`,
+  `camera.detail_distance`).
 - The composed world is compiled once and cached (`physics.cache_dir`, default
   `~/.cache/dim_go2_sim`); a store takes about 2 minutes the first time.
 

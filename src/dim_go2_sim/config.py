@@ -77,6 +77,12 @@ class CameraConfig(BaseModel):
     pitch_deg: float = 0.0
     near: float = 0.05
     far: float = 100.0
+    # Small objects (products, signs) are drawn only within this many metres, and this share of
+    # the scene's triangles is simplified away: tens of millions of vertices are too many for a
+    # software GPU (e.g. Docker's lavapipe). None is 8 m and no simplifying on a real GPU,
+    # 4 m and 0.95 on a software one.
+    detail_distance: float | None = None
+    simplify: float | None = None
     ambient: float = 1.8
     sun: float = 2.5
     background: str = "#1b2230"
