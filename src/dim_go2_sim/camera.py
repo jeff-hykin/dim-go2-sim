@@ -47,6 +47,16 @@ MIN_SIMPLIFY_TRIANGLES = 200
 CHUNK_CELL = 4.0
 # Objects smaller than this bounding radius, metres, are detail (products, signs).
 SMALL_RADIUS = 0.3
+# A sign is modelled a millimetre or two in front of its wall; seen from across a store, the wall
+# must still lose the depth test everywhere. That takes two things:
+# - Depth resolution. Each frame is drawn in two slices, [near, DEPTH_SPLIT] then [DEPTH_SPLIT,
+#   far], metres, each with the whole depth buffer: one slice from 5 cm resolves ~1 mm at 30 m;
+#   from 4 m, ~0.03 mm at 42 m.
+# - Small triangles. The GPU interpolates depth across a triangle, and across one many metres wide
+#   seen at an angle that is off by millimetres; triangles are split until no edge is longer than
+#   MAX_EDGE, metres.
+DEPTH_SPLIT = 4.0
+MAX_EDGE = 4.0
 # glTF is Y-up; the world is Z-up.
 Y_UP_TO_Z_UP = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=np.float64)
 
@@ -77,8 +87,8 @@ class _Renderer:
         self._extents = np.array([c.extent for c in self._chunks])
         self._reach = np.array([detail if c.small else config.far for c in self._chunks])
         self._scene = gfx.Scene()
-        background = gfx.Background(None, gfx.BackgroundMaterial(config.background))
-        self._scene.add(background, *[c.mesh for c in self._chunks])
+        self._background = gfx.Background(None, gfx.BackgroundMaterial(config.background))
+        self._scene.add(self._background, *[c.mesh for c in self._chunks])
         self._scene.add(gfx.AmbientLight("#ffffff", config.ambient))
         sun = gfx.DirectionalLight("#fff4e6", config.sun)
         sun.local.position = (4.0, -6.0, 10.0)
@@ -88,9 +98,11 @@ class _Renderer:
         # pygfx's fov spans the mean of the view's height and width; match the vertical fovy.
         aspect = config.width / config.height
         fov = math.degrees(2 * math.atan(config.height * (1 + aspect) / (4 * focal_length(config))))
-        self._camera = gfx.PerspectiveCamera(
-            fov=fov, aspect=aspect, depth_range=(config.near, config.far)
-        )
+        split = min(max(DEPTH_SPLIT, config.near), config.far)
+        self._slices = [
+            (gfx.PerspectiveCamera(fov=fov, aspect=aspect, depth_range=(split, config.far)), split),
+            (gfx.PerspectiveCamera(fov=fov, aspect=aspect, depth_range=(config.near, split)), 0.0),
+        ]
 
     def capture(
         self, position: NDArray[np.float64], forward: NDArray[np.float64], up: NDArray[np.float64]
@@ -98,14 +110,22 @@ class _Renderer:
         # Skip chunks wholly behind the camera, which can't change the image; on a software GPU
         # also small ones out of reach, as a store's tens of millions of vertices are too many.
         offset = self._centers - position
+        along = offset @ forward  # depth of each chunk's centre, as the slices measure it
         distance = np.linalg.norm(offset, axis=1) - self._extents
-        visible = (distance < self._reach) & (offset @ forward > -self._extents)
-        for chunk, show in zip(self._chunks, visible, strict=True):
-            chunk.mesh.visible = bool(show)
-        self._camera.world.position = tuple(position)
-        self._camera.world.reference_up = tuple(up)
-        self._camera.look_at(tuple(position + forward))
-        self._renderer.render(self._scene, self._camera)
+        visible = (distance < self._reach) & (along > -self._extents)
+        # The far slice first; the near one then draws over it with a fresh depth buffer.
+        for i, (camera, start) in enumerate(self._slices):
+            reaches = visible & (along + self._extents > start)
+            if i:
+                reaches &= along - self._extents < self._slices[0][1]
+                self._renderer.clear(depth=True)
+            for chunk, show in zip(self._chunks, reaches, strict=True):
+                chunk.mesh.visible = bool(show)
+            self._background.visible = not i
+            camera.world.position = tuple(position)
+            camera.world.reference_up = tuple(up)
+            camera.look_at(tuple(position + forward))
+            self._renderer.render(self._scene, camera, clear=not i, flush=False)
         self._renderer.flush()
         return np.ascontiguousarray(np.asarray(self._renderer.snapshot())[:, :, :3])
 
@@ -204,7 +224,8 @@ def _merge(
         attributes["texcoords"] = np.concatenate(texcoords)
     if reduction > 0 and len(attributes["indices"]) >= MIN_SIMPLIFY_TRIANGLES:
         attributes = _simplified(attributes, reduction)
-        vertices = attributes["positions"]
+    attributes = _subdivided(attributes, MAX_EDGE)
+    vertices = attributes["positions"]
     low, high = vertices.min(axis=0).astype(np.float64), vertices.max(axis=0).astype(np.float64)
     return _Chunk(
         mesh=gfx.Mesh(gfx.Geometry(**attributes), members[0][0].material),
@@ -212,6 +233,57 @@ def _merge(
         extent=float(np.linalg.norm(high - low)) / 2,
         small=small,
     )
+
+
+def _subdivided(attributes: dict[str, NDArray[Any]], max_edge: float) -> dict[str, NDArray[Any]]:
+    """The same surface, with every edge longer than *max_edge* split at its midpoint.
+
+    Whether an edge is split depends only on its length, so both triangles sharing it split it
+    at the same midpoint and no cracks open.
+    """
+    attributes = dict(attributes)
+    while True:
+        positions, triangles = attributes["positions"], attributes["indices"]
+        corners = positions[triangles]  # (T, 3 corners, 3)
+        # Edge k joins corner k to corner k+1.
+        long = np.linalg.norm(corners - np.roll(corners, -1, axis=1), axis=2) > max_edge
+        if not long.any():
+            return attributes
+        split = triangles[long.any(axis=1)]
+        pairs = np.stack([split, np.roll(split, -1, axis=1)], axis=2)[long[long.any(axis=1)]]
+        pairs = np.unique(np.sort(pairs, axis=1), axis=0)
+        midpoint = {(int(a), int(b)): len(positions) + i for i, (a, b) in enumerate(pairs)}
+        for name, values in list(attributes.items()):
+            if name == "indices":
+                continue
+            middle = (values[pairs[:, 0]] + values[pairs[:, 1]]) / 2
+            if name == "normals":
+                middle /= np.maximum(np.linalg.norm(middle, axis=1, keepdims=True), 1e-12)
+            attributes[name] = np.concatenate([values, middle.astype(values.dtype)])
+        kept = [triangles[~long.any(axis=1)]]
+        for a, b, c in split:
+            edges = [(a, b), (b, c), (c, a)]
+            mids = [midpoint.get((min(u, v), max(u, v))) for u, v in edges]
+            kept.append(np.array(_fan(a, b, c, *mids), np.uint32).reshape(-1, 3))
+        attributes["indices"] = np.concatenate(kept)
+
+
+def _fan(a: int, b: int, c: int, ab: int | None, bc: int | None, ca: int | None) -> list[int]:
+    """Triangle abc split at the midpoints given (None where an edge stays whole), same winding."""
+    if ab is not None and bc is not None and ca is not None:
+        return [a, ab, ca, ab, b, bc, ca, bc, c, ab, bc, ca]
+    if ab is not None and bc is not None:
+        return [a, ab, c, ab, bc, c, ab, b, bc]
+    if bc is not None and ca is not None:
+        return [b, bc, a, bc, ca, a, bc, c, ca]
+    if ca is not None and ab is not None:
+        return [c, ca, b, ca, ab, b, ca, a, ab]
+    if ab is not None:
+        return [a, ab, c, ab, b, c]
+    if bc is not None:
+        return [b, bc, a, bc, c, a]
+    assert ca is not None
+    return [c, ca, b, ca, a, b]
 
 
 def _serve(visual: str, y_up: bool, config: CameraConfig) -> None:
