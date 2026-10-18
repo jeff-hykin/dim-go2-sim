@@ -20,8 +20,9 @@ blueprint = autoconnect(
 
 With no scene it stands on bare ground. A scene is a cooked dimOS scene package by name
 (`scene.package`), an [InteriorGS](#interiorgs-homes) home (`scene.package="interiorgs/839920"`),
-or an MJCF of the collision geometry (`scene.mjcf`) and optionally what the camera draws
-(`scene.visual`): a textured glTF, or Gaussian splats (`.nurec`).
+a [real-world splat scan](#splat-scans) (`scene.package="supersplat/3f89bbd3"`, or
+`scene.scan=<a .ply>`), or an MJCF of the collision geometry (`scene.mjcf`) and optionally what
+the camera draws (`scene.visual`): a textured glTF, or Gaussian splats (`.nurec`, a 3DGS `.ply`).
 
 ### InteriorGS homes
 
@@ -36,6 +37,34 @@ and [collision mesh](https://huggingface.co/datasets/spatialverse/SAGE-3D_Collis
 mirrors) and cooks them into `physics.cache_dir` in under a minute. The robot starts at the
 most open spot on the floor, facing the longest clear view; the cooked scene keeps up to 8
 such spawn poses (`dim_go2_sim.interiorgs.load_scene(id).spawns`).
+
+### Splat scans
+
+```python
+Go2Sim.blueprint(scene={"package": "supersplat/3f89bbd3"})  # a SuperSplat scene by id
+Go2Sim.blueprint(scene={"scan": "my_home.ply", "scan_scale": 1.0})  # a 3DGS PLY or SOG meta.json
+```
+
+A Gaussian-splat scan of a real home: the camera draws its splats, and the robot and lidar collide
+with geometry built from them. The default scan is [an NJ ranch home](https://superspl.at/scene/3f89bbd3)
+(2.7M splats, 31 MB, downloaded from SuperSplat on first use). A scan has no collision mesh and an
+arbitrary frame and scale, so the first run cooks it (a few seconds):
+
+- **Level.** The floor, the densest layer at the bottom of the scan, is fitted by RANSAC and
+  turned to z = 0; the walls (thin upright splats) are turned square to x and y.
+- **Metres.** A scan's units are arbitrary: `scene.scan_scale` gives metres per unit. A known
+  SuperSplat scene has a measured one (`dim_go2_sim.supersplat.SCALES`); the ranch home's is 0.92,
+  from its US-standard fittings: its kitchen counters are 0.985 units high and stand 36 in
+  (0.914 m), its interior door openings 2.31 units and an 80 in door's ~2.05 m (0.928 and 0.89),
+  and its walls, cut off at the ceiling, then reach 2.3 m, under an 8 ft ceiling.
+- **Collisions.** Opaque splats under 15 cm across are voxelised at 5 cm (two to a voxel), specks
+  under 30 voxels dropped as floaters, and a column solid for 0.6 m of the metre below 2 m filled
+  down to the floor (walls' feet are thin in a scan). As with InteriorGS, the voxels up to 2 m are
+  merged into boxes for MuJoCo over a floor plane, and the lidar casts against the voxels' faces
+  and the floor under the scan. Spawns are picked on open floor.
+
+Only a scan's degree-0 (view-independent) colour is kept: higher spherical harmonics would have
+to be turned with it. Splats from a 3DGS PLY are drawn as the InteriorGS ones are, evaluated in 3D.
 
 ## Streams
 
@@ -59,16 +88,16 @@ the file on `mesh_info` (named with its current hash) unless the request ends `&
 hash>`. The root link is `world`; `base_link` hangs off it by a floating joint and each link is
 posed by its tf frame. The scene is fixed at `world`: `scene_mesh` is its collision surfaces,
 simplified to `urdf.scene_faces` triangles in STL tiles (`scenes/<scene>/mesh_000.stl`, ...),
-and for an InteriorGS home `scene_splats` is its Gaussian splats as one SPZ file
-(`scenes/interiorgs_<id>/splats.spz`, world frame, Z up). The files are built once per scene into
+and for a splat scene (an InteriorGS home, a scan) `scene_splats` is its Gaussian splats as one
+SPZ file (`scenes/interiorgs_<id>/splats.spz`, world frame, Z up). The files are built once per scene into
 `physics.cache_dir`. `urdf.enabled=false` turns all of it, and the leg tf, off.
 
 ## Config
 
 `Go2SimConfig` has a section per part, each overridable from a blueprint or the dimOS CLI:
 
-- `scene`: `package`, `mjcf`, `visual`, `visual_y_up`, `start` (x, y, yaw; default the scene's
-  first spawn), `floor_z`, `floor_top_z`
+- `scene`: `package`, `scan`, `scan_scale`, `mjcf`, `visual`, `visual_y_up`, `start` (x, y, yaw;
+  default the scene's first spawn), `floor_z`, `floor_top_z`
 - `physics`: `timestep`, `fitted`, `actuator_tau`, `policy`, `track_velocity`,
   `command_timeout`, `max_velocity`, `realtime`, `cache_dir`
 - `lidar`: `enabled`, `rate_hz`, `xyz`, `pitch_deg`, `point_rate_hz`, `downsample`,
@@ -117,7 +146,8 @@ uv venv --python 3.12 && uv pip install -e . pytest
 pytest
 ```
 
-The tests on a real InteriorGS home run once it is cooked, or with `DIM_GO2_SIM_DOWNLOAD=1`.
+The tests on a real InteriorGS home and the ranch scan run once they are cooked, or with
+`DIM_GO2_SIM_DOWNLOAD=1`.
 
 ## Licenses
 
@@ -130,3 +160,9 @@ license, [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (non-co
 only). InteriorGS is by SpatialVerse; the USDZ and collision-mesh conversions
 are SAGE-3D's ([paper](https://huggingface.co/papers/2510.21307),
 [code](https://github.com/Galery23/SAGE-3D_Official)).
+
+The ranch home scan is not bundled either: it is downloaded from SuperSplat on first use.
+"[Home Scan (Creation process in description)](https://superspl.at/scene/3f89bbd3)" is by
+Isaiah Sweeney ([luxury_scans](https://superspl.at/user/luxury_scans)), licensed
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The sim levels, scales and
+voxelises it, and keeps only its degree-0 colour.

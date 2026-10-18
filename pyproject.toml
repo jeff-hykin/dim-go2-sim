@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dim-go2-sim"
-version = "0.3.0"
+version = "0.4.0"
 description = "A simulated Unitree Go2 for dimOS: cmd_vel in; Mid-360 lidar, textured or Gaussian-splat camera, IMU, odometry and contacts out"
 readme = "README.md"
 license = "Apache-2.0"
@@ -24,6 +24,7 @@ dependencies = [
     "fast-simplification>=0.1.7",
     "rendercanvas>=2.0",
     "msgpack>=1.0",  # InteriorGS splats
+    "pillow>=10",  # SuperSplat scans (SOG images)
     "usd-core>=24.11; platform_system != 'Linux' or platform_machine != 'aarch64'",  # their meshes
 ]
 

@@ -262,7 +262,17 @@ def spawn_poses(
         cell = np.floor((points[:, :2] - origin[:2]) / VOXEL).astype(np.int64)
         cell = cell[(cell >= 0).all(axis=1) & (cell < has_floor.shape).all(axis=1)]
         has_floor[cell[:, 0], cell[:, 1]] = True
-    has_floor = ndimage.binary_closing(has_floor, iterations=2)
+    return open_floor_spawns(ndimage.binary_closing(has_floor, iterations=2), occupied, origin)
+
+
+def open_floor_spawns(
+    has_floor: NDArray[np.bool_], occupied: NDArray[np.bool_], origin: NDArray[np.float64]
+) -> list[tuple[float, float, float]]:
+    """Spawns on the VOXEL grid: cells with floor (has_floor, x by y) and no occupied voxel
+    below ROBOT_HEIGHT, as far from the rest as possible, SPAWN_SPACING apart, each facing the
+    longest clear view; the most open first."""
+    from scipy import ndimage
+
     blocked = occupied[:, :, : math.ceil(ROBOT_HEIGHT / VOXEL)].any(axis=2)
     free = has_floor & ~blocked
     clearance = ndimage.distance_transform_edt(free) * VOXEL

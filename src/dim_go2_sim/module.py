@@ -45,7 +45,7 @@ from pydantic import Field
 from reactivex.disposable import Disposable
 from scipy.spatial.transform import Rotation
 
-from dim_go2_sim import interiorgs
+from dim_go2_sim import interiorgs, supersplat
 from dim_go2_sim.config import CameraConfig, LidarConfig, PhysicsConfig, SceneConfig, UrdfConfig
 from dim_go2_sim.contacts import Contacts, ContactSensor
 from dim_go2_sim.lidar import (
@@ -56,6 +56,7 @@ from dim_go2_sim.lidar import (
     static_geoms,
     static_triangles,
 )
+from dim_go2_sim.splat import is_splats
 from dim_go2_sim.urdf import (
     MeshFile,
     SceneSource,
@@ -214,7 +215,7 @@ class Go2Sim(Module):
                 planes = model.geom_type == mujoco.mjtGeom.mjGEOM_PLANE
                 return static_triangles(model, data, static_geoms(model, robot) & ~planes)
 
-            splats = scene.visual if scene.visual and scene.visual.suffix == ".nurec" else None
+            splats = scene.visual if scene.visual and is_splats(scene.visual) else None
             source = SceneSource(scene.name, scene.key, mesh, splats)
         started = time.monotonic()
         robot = go2_spec(False).compile()
@@ -416,8 +417,28 @@ class ResolvedScene:
 
 
 def resolve_scene(scene: SceneConfig, cache_dir: Path | None = None) -> ResolvedScene:
-    """The scene's files, from a package or explicit paths; an InteriorGS home is downloaded and
-    cooked the first time."""
+    """The scene's files, from a package, a splat scan, or explicit paths; an InteriorGS home or a
+    SuperSplat scan is downloaded and cooked the first time."""
+    home = supersplat.scene_id(scene.package) if scene.package else None
+    if scene.scan is not None or home is not None:
+        if home is not None:
+            scan = supersplat.load_scene(home, cache_dir, scene.scan_scale)
+            name = f"supersplat_{home}"
+        else:
+            scan = supersplat.load_scan(scene.scan, cache_dir, scene.scan_scale or 1.0)
+            name = f"scan_{scan.splats.parent.name}"
+        mesh = np.load(scan.collision)
+        visual = scene.visual or scan.splats
+        return ResolvedScene(
+            scene.mjcf or scan.mjcf,
+            visual,
+            False,
+            scan.floor_z,
+            tuple(scan.spawns),
+            (mesh["vertices"], mesh["faces"]),
+            name=name,
+            key=_files_key(scan.collision, visual),
+        )
     if scene.package is None:
         return ResolvedScene(
             scene.mjcf,

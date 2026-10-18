@@ -34,7 +34,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from dim_go2_sim.config import CameraConfig
-from dim_go2_sim.splat import SplatRenderer, load_nurec
+from dim_go2_sim.splat import SplatRenderer, is_splats, load_splats
 
 # Most vertices in one merged mesh: 12 bytes each keeps a buffer far under 128 MB.
 MAX_VERTICES = 2_000_000
@@ -343,8 +343,8 @@ def _fan(a: int, b: int, c: int, ab: int | None, bc: int | None, ca: int | None)
 
 def _serve(visual: str, y_up: bool, config: CameraConfig) -> None:
     renderer: _Renderer | SplatRenderer
-    if visual.endswith(".nurec"):
-        renderer = SplatRenderer(load_nurec(visual), config)
+    if is_splats(visual):
+        renderer = SplatRenderer(load_splats(visual), config)
     else:
         renderer = _Renderer(visual, y_up, config)
     out = sys.stdout.buffer

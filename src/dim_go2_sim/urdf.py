@@ -98,7 +98,7 @@ class SceneSource:
     name: str  # names its files: package://dim_go2_sim/scenes/<name>/...
     key: str  # changes whenever what it is built from does
     mesh: Callable[[], Mesh]  # world-frame collision surfaces, called only on a cache miss
-    splats: Path | None = None  # a NuRec container
+    splats: Path | None = None  # Gaussian splats: a NuRec container or a 3DGS PLY
 
 
 def share_urdf(
@@ -264,9 +264,9 @@ def _write_scene(scene: SceneSource, config: UrdfConfig, folder: Path) -> None:
     for i, tile in enumerate(tiles(vertices, faces, config.tile_faces)):
         (folder / f"mesh_{i:03d}.stl").write_bytes(stl(*tile))
     if scene.splats is not None:
-        from dim_go2_sim.splat import load_nurec, spz
+        from dim_go2_sim.splat import load_splats, spz
 
-        (folder / "splats.spz").write_bytes(spz(load_nurec(scene.splats), config.splats_sh_degree))
+        (folder / "splats.spz").write_bytes(spz(load_splats(scene.splats), config.splats_sh_degree))
 
 
 def merged(meshes: list[Mesh]) -> Mesh:

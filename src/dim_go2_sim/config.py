@@ -24,10 +24,17 @@ from pydantic import BaseModel, Field
 
 class SceneConfig(BaseModel):
     # A cooked dimOS scene package by name (resolved with dimOS's catalog), an InteriorGS home
-    # as "interiorgs/<id>" (downloaded on first use), or explicit files.
+    # as "interiorgs/<id>" or a SuperSplat scan as "supersplat/<id>" (downloaded on first use),
+    # or explicit files.
     package: str | None = None
+    # A real-world Gaussian-splat scan (a 3DGS .ply, or a SOG's meta.json), levelled and given
+    # collisions from its splats the first time, as a SuperSplat one is.
+    scan: Path | None = None
+    # Metres per unit of the scan; None is the scale measured for a known SuperSplat scene, else 1.
+    scan_scale: float | None = Field(default=None, gt=0.0)
     mjcf: Path | None = None  # collision geometry; a robot-free MJCF
-    # What the camera draws: a textured glTF/GLB, or Gaussian splats (.nurec); None draws nothing.
+    # What the camera draws: a textured glTF/GLB, or Gaussian splats (.nurec, or a 3DGS .ply);
+    # None draws nothing.
     visual: Path | None = None
     visual_y_up: bool = True  # glTF's convention; the world is Z-up
     # x, y, yaw of the robot; None is the scene's first spawn pose, or the origin.

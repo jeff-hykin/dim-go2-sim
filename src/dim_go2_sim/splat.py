@@ -179,7 +179,8 @@ fn fs_main(in: Varyings) -> @location(0) vec4<f32> {
 @dataclass
 class Splats:
     """Gaussians in the world frame: positions, w-x-y-z rotations, log scales, opacities in
-    [0, 1], and (N, 16, 3) spherical-harmonic colour coefficients."""
+    [0, 1], and (N, K, 3) spherical-harmonic colour coefficients, K = 1, 4, 9 or 16 (degree 0-3),
+    as 3DGS's: colour = 0.5 + the SH sum."""
 
     positions: NDArray[np.float32]
     rotations: NDArray[np.float16]
@@ -189,6 +190,163 @@ class Splats:
 
     def __len__(self) -> int:
         return len(self.positions)
+
+    @property
+    def sh_degree(self) -> int:
+        return math.isqrt(self.sh.shape[1]) - 1
+
+
+def load_splats(path: Path | str) -> Splats:
+    """Splats from a NuRec container (.nurec), a 3DGS PLY (.ply), or a SOG's meta.json."""
+    path = Path(path)
+    if path.suffix == ".nurec":
+        return load_nurec(path)
+    if path.suffix == ".ply":
+        return load_ply(path)
+    if path.name.endswith("meta.json"):
+        return load_sog(path)
+    raise ValueError(f"{path}: not splats (.nurec, .ply, or a SOG's meta.json)")
+
+
+def is_splats(path: Path | str) -> bool:
+    return Path(path).suffix in (".nurec", ".ply") or str(path).endswith("meta.json")
+
+
+_PLY_TYPES = {
+    "char": "i1",
+    "uchar": "u1",
+    "short": "<i2",
+    "ushort": "<u2",
+    "int": "<i4",
+    "uint": "<u4",
+    "float": "<f4",
+    "double": "<f8",
+    "int8": "i1",
+    "uint8": "u1",
+    "int16": "<i2",
+    "uint16": "<u2",
+    "int32": "<i4",
+    "uint32": "<u4",
+    "float32": "<f4",
+    "float64": "<f8",
+}
+
+
+def load_ply(path: Path | str) -> Splats:
+    """Splats from a 3DGS PLY (binary little-endian): x y z, f_dc_*, f_rest_* (channel-major),
+    opacity (a logit), scale_* (logs), rot_* (w x y z)."""
+    with open(path, "rb") as file:
+        if file.readline().strip() != b"ply":
+            raise ValueError(f"{path}: not a PLY")
+        fields: list[tuple[str, str]] = []
+        count, vertex = 0, False
+        while (line := file.readline().decode("ascii").split()) != ["end_header"]:
+            if line[:1] == ["format"] and line[1] != "binary_little_endian":
+                raise ValueError(f"{path}: only binary little-endian PLYs are read")
+            if line[:1] == ["element"]:
+                vertex = line[1] == "vertex"
+                count = int(line[2]) if vertex else count
+            elif line[:1] == ["property"] and vertex:
+                fields.append((line[2], _PLY_TYPES[line[1]]))
+        data = np.fromfile(file, np.dtype(fields), count)
+
+    def columns(*names: str) -> NDArray[np.float32]:
+        return np.stack([data[n].astype(np.float32) for n in names], axis=1)
+
+    names = set(data.dtype.names or ())
+    rest = sum(1 for n in names if n.startswith("f_rest_")) // 3
+    coefficients = min(rest + 1, SH_COEFFICIENTS)
+    sh = np.zeros((count, coefficients, 3), np.float32)
+    sh[:, 0] = columns("f_dc_0", "f_dc_1", "f_dc_2")
+    for c in range(3):
+        for k in range(1, coefficients):
+            sh[:, k, c] = data[f"f_rest_{c * rest + k - 1}"]
+    return Splats(
+        positions=columns("x", "y", "z"),
+        rotations=columns("rot_0", "rot_1", "rot_2", "rot_3").astype(np.float16),
+        log_scales=columns("scale_0", "scale_1", "scale_2").astype(np.float16),
+        opacities=(1 / (1 + np.exp(-data["opacity"].astype(np.float32)))).astype(np.float16),
+        sh=sh.astype(np.float16),
+    )
+
+
+def save_ply(splats: Splats, path: Path | str) -> None:
+    """*splats* as a 3DGS PLY, as load_ply reads it."""
+    coefficients = splats.sh.shape[1]
+    names = ["x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2"]
+    names += [f"f_rest_{i}" for i in range(3 * (coefficients - 1))]
+    names += ["opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
+    sh = splats.sh.astype(np.float32)
+    opacity = np.clip(splats.opacities.astype(np.float32), 1e-6, 1 - 1e-6)
+    table = np.concatenate(
+        [
+            splats.positions.astype(np.float32),
+            sh[:, 0],
+            sh[:, 1:].transpose(0, 2, 1).reshape(len(splats), -1),  # channel-major
+            np.log(opacity / (1 - opacity))[:, None],
+            splats.log_scales.astype(np.float32),
+            splats.rotations.astype(np.float32),
+        ],
+        axis=1,
+    ).astype("<f4")
+    header = "ply\nformat binary_little_endian 1.0\nelement vertex {}\n{}end_header\n".format(
+        len(splats), "".join(f"property float {n}\n" for n in names)
+    )
+    with open(path, "wb") as file:
+        file.write(header.encode("ascii"))
+        file.write(table.tobytes())
+
+
+def load_sog(meta: Path | str) -> Splats:
+    """Splats from PlayCanvas's SOG (version 2): a meta.json beside lossless WebP images."""
+    import json
+
+    from PIL import Image
+
+    folder = Path(meta).parent
+    info = json.loads(Path(meta).read_text())
+    if info.get("version") != 2:
+        raise ValueError(f"{meta}: only SOG version 2 is read")
+    count = info["count"]
+
+    def pixels(name: str) -> NDArray[np.uint8]:
+        image = np.asarray(Image.open(folder / name).convert("RGBA"))
+        return image.reshape(-1, 4)[:count]
+
+    low, high = (pixels(f)[:, :3].astype(np.float64) for f in info["means"]["files"])
+    mins, maxs = np.array(info["means"]["mins"]), np.array(info["means"]["maxs"])
+    logged = mins + (maxs - mins) * (low + 256 * high) / 65535
+    positions = np.sign(logged) * np.expm1(np.abs(logged))  # stored as sign(x) log(|x| + 1)
+    # The three smaller quaternion components, then which (w x y z) is the largest, plus 252.
+    quats = pixels(info["quats"]["files"][0])
+    largest = np.clip(quats[:, 3].astype(np.int64) - 252, 0, 3)
+    smaller = (quats[:, :3] / 255 * 2 - 1) / math.sqrt(2)
+    rotations = np.zeros((count, 4))
+    others = np.array([[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]])[largest]
+    np.put_along_axis(rotations, others, smaller, axis=1)
+    rest = np.sqrt(np.clip(1 - (smaller**2).sum(axis=1), 0, None))
+    np.put_along_axis(rotations, largest[:, None], rest[:, None], axis=1)
+    log_scales = np.asarray(info["scales"]["codebook"])[pixels(info["scales"]["files"][0])[:, :3]]
+    colour = pixels(info["sh0"]["files"][0])
+    dc = np.asarray(info["sh0"]["codebook"])[colour[:, :3]]
+    sh = dc[:, None, :]
+    if "shN" in info and info["shN"].get("bands", 0) > 0:
+        coefficients = (info["shN"]["bands"] + 1) ** 2 - 1
+        codebook = np.asarray(info["shN"]["codebook"])
+        centroids = np.asarray(Image.open(folder / info["shN"]["files"][0]).convert("RGBA"))
+        labels = pixels(info["shN"]["files"][1]).astype(np.int64)
+        label = np.minimum(labels[:, 0] | (labels[:, 1] << 8), info["shN"]["count"] - 1)
+        # Centroid c's coefficient k is pixel (c % 64 * coefficients + k, c // 64).
+        k = np.arange(coefficients)
+        palette = centroids[label[:, None] // 64, (label[:, None] % 64) * coefficients + k, :3]
+        sh = np.concatenate([sh, codebook[palette]], axis=1)
+    return Splats(
+        positions=positions.astype(np.float32),
+        rotations=rotations.astype(np.float16),
+        log_scales=log_scales.astype(np.float16),
+        opacities=(colour[:, 3] / 255).astype(np.float16),  # stored as the opacity itself
+        sh=sh[:, :SH_COEFFICIENTS].astype(np.float16),
+    )
 
 
 def load_nurec(path: Path | str) -> Splats:
@@ -222,6 +380,7 @@ def spz(splats: Splats, sh_degree: int = 3) -> bytes:
     """Niantic's SPZ (version 2, gzipped), as Spark loads it: positions in 12-bit fixed point,
     the rest quantised to bytes; in the world frame (Z up, metres)."""
     count = len(splats)
+    sh_degree = min(sh_degree, splats.sh_degree)
 
     def byte(values: NDArray[np.floating]) -> NDArray[np.uint8]:
         return np.clip(np.rint(values), 0, 255).astype(np.uint8)
@@ -273,7 +432,12 @@ class SplatRenderer:
         self._focal = focal_length(config)
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
         packed = _packed_splats(splats)
-        channels = [np.ascontiguousarray(splats.sh[:, :, c]).view(np.uint32) for c in range(3)]
+        sh = splats.sh
+        if sh.shape[1] < SH_COEFFICIENTS:  # the shader reads degree 3; the rest are zero
+            sh = np.concatenate(
+                [sh, np.zeros((len(sh), SH_COEFFICIENTS - sh.shape[1], 3), np.float16)], axis=1
+            )
+        channels = [np.ascontiguousarray(sh[:, :, c]).view(np.uint32) for c in range(3)]
         largest = max(packed.nbytes, 4 * len(splats), *(c.nbytes for c in channels))
         limits = adapter.limits
         self._device = device = adapter.request_device_sync(
