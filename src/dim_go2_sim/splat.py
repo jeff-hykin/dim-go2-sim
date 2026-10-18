@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import gzip
 import math
 from pathlib import Path
+import struct
 
 import numpy as np
 from numpy.typing import NDArray
@@ -215,6 +216,35 @@ def load_nurec(path: Path | str) -> Splats:
         opacities=(1 / (1 + np.exp(-density))).astype(np.float16),  # densities are logits
         sh=sh[:, :SH_COEFFICIENTS].astype(np.float16),
     )
+
+
+def spz(splats: Splats, sh_degree: int = 3) -> bytes:
+    """Niantic's SPZ (version 2, gzipped), as Spark loads it: positions in 12-bit fixed point,
+    the rest quantised to bytes; in the world frame (Z up, metres)."""
+    count = len(splats)
+
+    def byte(values: NDArray[np.floating]) -> NDArray[np.uint8]:
+        return np.clip(np.rint(values), 0, 255).astype(np.uint8)
+
+    fixed = np.rint(splats.positions.astype(np.float64) * (1 << 12)).astype("<i4")
+    rotations = splats.rotations.astype(np.float32)
+    xyzw = np.roll(rotations / np.linalg.norm(rotations, axis=1, keepdims=True), -1, axis=1)
+    xyzw *= np.where(xyzw[:, 3:] < 0, -1.0, 1.0)  # w >= 0, so only x, y, z are stored
+    parts = [
+        struct.pack("<IIIBBBB", 0x5053474E, 2, count, sh_degree, 12, 0, 0),
+        fixed.view(np.uint8).reshape(count, 3, 4)[:, :, :3].tobytes(),
+        byte(splats.opacities.astype(np.float32) * 255).tobytes(),
+        byte(splats.sh[:, 0].astype(np.float32) * (0.15 * 255) + 127.5).tobytes(),
+        byte((splats.log_scales.astype(np.float32) + 10) * 16).tobytes(),
+        byte(xyzw[:, :3] * 127.5 + 127.5).tobytes(),
+    ]
+    rest = (sh_degree + 1) ** 2 - 1
+    if rest:
+        # Degree 1 keeps 5 bits a value, the higher degrees 4, as SPZ's own encoder.
+        levels = np.rint(splats.sh[:, 1 : 1 + rest].astype(np.float32) * 128) + 128
+        bucket = np.where(np.arange(rest) < 3, 8, 16)[None, :, None]
+        parts.append(byte((levels + bucket // 2) // bucket * bucket).tobytes())
+    return gzip.compress(b"".join(parts), 6)
 
 
 def _packed_splats(splats: Splats) -> NDArray[np.uint32]:

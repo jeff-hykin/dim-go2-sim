@@ -36,6 +36,9 @@ from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.Imu import Imu
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.msgs.tf2_msgs.TFMessage import TFMessage
+from dimos.utils.logging_config import setup_logger
+from dimos_lcm.std_msgs import String
+import mujoco
 import numpy as np
 from numpy.typing import NDArray
 from pydantic import Field
@@ -43,10 +46,27 @@ from reactivex.disposable import Disposable
 from scipy.spatial.transform import Rotation
 
 from dim_go2_sim import interiorgs
-from dim_go2_sim.config import CameraConfig, LidarConfig, PhysicsConfig, SceneConfig
+from dim_go2_sim.config import CameraConfig, LidarConfig, PhysicsConfig, SceneConfig, UrdfConfig
 from dim_go2_sim.contacts import Contacts, ContactSensor
-from dim_go2_sim.lidar import LidarScan, Raycaster, RollingLidar, mount_rotation
-from dim_go2_sim.world import Go2World, compose, load_world
+from dim_go2_sim.lidar import (
+    LidarScan,
+    Raycaster,
+    RollingLidar,
+    mount_rotation,
+    static_geoms,
+    static_triangles,
+)
+from dim_go2_sim.urdf import (
+    MeshFile,
+    SceneSource,
+    SharedUrdf,
+    body_in_parent,
+    leg_bodies,
+    share_urdf,
+)
+from dim_go2_sim.world import PREFIX, Go2World, compose, go2_spec, load_world
+
+logger = setup_logger()
 
 # The optical frame's axes (z forward, x right, y down) as columns, in a forward-looking body frame.
 OPTICAL_IN_BODY = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
@@ -57,6 +77,7 @@ class Go2SimConfig(ModuleConfig):
     physics: PhysicsConfig = Field(default_factory=PhysicsConfig)
     lidar: LidarConfig = Field(default_factory=LidarConfig)
     camera: CameraConfig = Field(default_factory=CameraConfig)
+    urdf: UrdfConfig = Field(default_factory=UrdfConfig)
     odom_hz: float = 50.0
     imu_hz: float = 50.0
     frame_prefix: str = ""  # namespaces every frame published, e.g. "go2/"
@@ -79,6 +100,11 @@ class Go2Sim(Module):
     odom: Out[PoseStamped]
     tf: Out[TFMessage]
     contacts: Out[Contacts]
+    # The robot and scene as a URDF, its meshes named package://dim_go2_sim/<path>?hash=<sha256>;
+    # any of those names on mesh_request gets the file on mesh_info, unless it has &have=<sha256>.
+    urdf_info: Out[String]
+    mesh_request: In[String]
+    mesh_info: Out[MeshFile]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -89,6 +115,9 @@ class Go2Sim(Module):
         self._command_time = -math.inf
         self._pose: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None
         self._clock_origin = 0.0
+        self._shared_urdf: SharedUrdf | None = None
+        self._mesh_requests: list[str] = []
+        self._mesh_wanted = threading.Condition()
 
     @rpc
     def start(self) -> None:
@@ -125,9 +154,18 @@ class Go2Sim(Module):
             )
             self._lidar_mount = mount_rotation(cfg.lidar.pitch_deg)
             self._lidar = RollingLidar(cfg.lidar, raycaster, self._lidar_pose)
+        # Each leg link's tf edge from its parent's frame, published with the body pose.
+        legs = leg_bodies(model, self.world.trunk) if cfg.urdf.enabled else []
+        self._leg_edges = [(b, p, self._frame_of(b), self._frame_of(p)) for b, p in legs]
         self.register_disposable(Disposable(self.cmd_vel.subscribe(self._on_cmd_vel)))
         self._stop.clear()
         self._threads = [threading.Thread(target=self._run, name="go2-sim", daemon=True)]
+        if cfg.urdf.enabled:
+            self.register_disposable(Disposable(self.mesh_request.subscribe(self._on_mesh_request)))
+            self._threads += [
+                threading.Thread(target=self._share_urdf, args=(scene,), daemon=True),
+                threading.Thread(target=self._answer_mesh_requests, daemon=True),
+            ]
         if cfg.camera.enabled and scene.visual is not None:
             self._threads.append(
                 threading.Thread(
@@ -140,6 +178,8 @@ class Go2Sim(Module):
     @rpc
     def stop(self) -> None:
         self._stop.set()
+        with self._mesh_wanted:
+            self._mesh_wanted.notify_all()
         for thread in self._threads:
             thread.join(timeout=10)
         super().stop()
@@ -153,6 +193,63 @@ class Go2Sim(Module):
         with self._lock:
             self._command = np.array([twist.linear.x, twist.linear.y, twist.angular.z])
             self._command_time = time.monotonic()
+
+    def _frame_of(self, body: int) -> str:
+        if body == self.world.trunk:
+            return self.frames["base_link"]
+        return self.config.frame_prefix + self.world.model.body(body).name.removeprefix(PREFIX)
+
+    def _share_urdf(self, scene: ResolvedScene) -> None:
+        """Builds the URDF's files (once per scene: a store's take a minute), then re-sends it."""
+        cfg = self.config
+        source = None
+        if scene.name is not None:
+
+            def mesh() -> tuple[NDArray[np.float32], NDArray[np.uint32]]:
+                if scene.lidar_mesh is not None:
+                    return scene.lidar_mesh
+                model, data = self.world.model, self.world.data
+                robot = {b for b in range(model.nbody) if self.world.is_robot(b)}
+                # A plane is 2 km of floor: a viewer draws its own.
+                planes = model.geom_type == mujoco.mjtGeom.mjGEOM_PLANE
+                return static_triangles(model, data, static_geoms(model, robot) & ~planes)
+
+            splats = scene.visual if scene.visual and scene.visual.suffix == ".nurec" else None
+            source = SceneSource(scene.name, scene.key, mesh, splats)
+        started = time.monotonic()
+        robot = go2_spec(False).compile()
+        shared = share_urdf(robot, cfg.frame_prefix, source, cfg.urdf, cfg.physics.cache_dir)
+        self._shared_urdf = shared
+        logger.info(
+            f"urdf_info: {len(shared.files)} mesh files, "
+            f"{sum(p.stat().st_size for p, _ in shared.files.values()) / 1e6:.1f} MB, "
+            f"ready in {time.monotonic() - started:.1f} s"
+        )
+        while not self._stop.is_set():
+            self.urdf_info.publish(String(shared.xml))
+            self._stop.wait(cfg.urdf.period_s)
+
+    def _on_mesh_request(self, request: String) -> None:
+        with self._mesh_wanted:
+            self._mesh_requests.append(request.data)
+            self._mesh_wanted.notify()
+
+    def _answer_mesh_requests(self) -> None:
+        """One at a time, off the transport's thread: a file can be tens of MB."""
+        while not self._stop.is_set():
+            with self._mesh_wanted:
+                while not self._mesh_requests and not self._stop.is_set():
+                    self._mesh_wanted.wait()
+                requests, self._mesh_requests = self._mesh_requests, []
+            for request in dict.fromkeys(requests):
+                shared = self._shared_urdf
+                try:
+                    mesh = shared.answer(request) if shared is not None else None
+                except KeyError:
+                    logger.warning(f"mesh_request for {request!r}: not a mesh in urdf_info")
+                    continue
+                if mesh is not None:
+                    self.mesh_info.publish(mesh)
 
     def _lidar_pose(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         position, rotation = self.world.base_pose()
@@ -235,6 +332,18 @@ class Go2Sim(Module):
                     ts=stamp,
                 )
             )
+        for body, parent, child, parent_frame in self._leg_edges:
+            translation, rotation = body_in_parent(self.world.data, body, parent)
+            qx, qy, qz, qw = Rotation.from_matrix(rotation).as_quat()
+            transforms.append(
+                Transform(
+                    translation=Vector3(*translation),
+                    rotation=Quaternion(qx, qy, qz, qw),
+                    frame_id=parent_frame,
+                    child_frame_id=child,
+                    ts=stamp,
+                )
+            )
         self.tf.publish(TFMessage(*transforms))
 
     def _publish_imu(self, stamp: float) -> None:
@@ -302,23 +411,34 @@ class ResolvedScene:
     spawns: tuple[tuple[float, float, float], ...] = ()  # x, y, yaw
     # What the lidar casts against in place of the MJCF's static geoms: vertices and faces.
     lidar_mesh: tuple[NDArray[np.float32], NDArray[np.uint32]] | None = None
+    name: str | None = None  # names the scene's files in urdf_info; None for bare ground
+    key: str = ""  # changes whenever the files it is built from do
 
 
 def resolve_scene(scene: SceneConfig, cache_dir: Path | None = None) -> ResolvedScene:
     """The scene's files, from a package or explicit paths; an InteriorGS home is downloaded and
     cooked the first time."""
     if scene.package is None:
-        return ResolvedScene(scene.mjcf, scene.visual, scene.visual_y_up)
+        return ResolvedScene(
+            scene.mjcf,
+            scene.visual,
+            scene.visual_y_up,
+            name=scene.mjcf.stem if scene.mjcf else None,
+            key=_files_key(scene.mjcf, scene.visual),
+        )
     if (home := interiorgs.scene_id(scene.package)) is not None:
         cooked = interiorgs.load_scene(home, cache_dir)
         mesh = np.load(cooked.collision)
+        visual = scene.visual or cooked.splats
         return ResolvedScene(
             scene.mjcf or cooked.mjcf,
-            scene.visual or cooked.splats,
+            visual,
             False,
             cooked.floor_z,
             tuple(cooked.spawns),
             (mesh["vertices"], mesh["faces"]),
+            name=f"interiorgs_{home}",
+            key=_files_key(cooked.collision, visual),
         )
     from dimos.simulation.scenes.catalog import resolve_scene_package
 
@@ -326,6 +446,15 @@ def resolve_scene(scene: SceneConfig, cache_dir: Path | None = None) -> Resolved
     a = package.alignment
     if a.scale != 1 or any(a.translation) or any(a.rotation_zyx_deg):
         raise ValueError(f"{scene.package}: only a Y-up/Z-up alignment is supported")
+    mjcf = scene.mjcf or package.mujoco_scene_path
     return ResolvedScene(
-        scene.mjcf or package.mujoco_scene_path, scene.visual or package.visual_path, a.y_up
+        mjcf,
+        scene.visual or package.visual_path,
+        a.y_up,
+        name=scene.package.replace("/", "_"),
+        key=_files_key(mjcf),
     )
+
+
+def _files_key(*paths: Path | None) -> str:
+    return " ".join(f"{p}:{p.stat().st_mtime_ns}" for p in paths if p is not None)

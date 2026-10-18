@@ -21,6 +21,7 @@ import struct
 import threading
 import time
 from typing import Any
+import xml.etree.ElementTree as ET
 
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.core.coordination.module_coordinator import ModuleCoordinator
@@ -35,10 +36,14 @@ from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.Imu import Imu
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.msgs.tf2_msgs.TFMessage import TFMessage
+from dimos_lcm.std_msgs import String
 import numpy as np
 import pytest
 
 from dim_go2_sim import Contacts, Go2Sim
+from dim_go2_sim.urdf import MeshFile
+
+STREAMS = ("lidar", "color_image", "camera_info", "imu", "odom", "tf", "contacts", "urdf_info")
 
 
 class Probe(Module):
@@ -50,6 +55,9 @@ class Probe(Module):
     odom: In[PoseStamped]
     tf: In[TFMessage]
     contacts: In[Contacts]
+    urdf_info: In[String]
+    mesh_request: Out[String]
+    mesh_info: In[MeshFile]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -60,7 +68,7 @@ class Probe(Module):
     @rpc
     def start(self) -> None:
         super().start()
-        for name in ("lidar", "color_image", "camera_info", "imu", "odom", "tf", "contacts"):
+        for name in (*STREAMS, "mesh_info"):
             getattr(self, name).subscribe(lambda msg, name=name: self._on(name, msg))
 
     def _on(self, name: str, msg: Any) -> None:
@@ -85,6 +93,31 @@ class Probe(Module):
         with self._lock:
             image = self._last["color_image"]
         return float(np.asarray(image.data, dtype=np.float64).std())
+
+    @rpc
+    def frames(self) -> list[str]:
+        with self._lock:
+            return [t.child_frame_id for t in self._last["tf"].transforms]
+
+    @rpc
+    def urdf(self) -> str:
+        with self._lock:
+            return str(self._last["urdf_info"].data)
+
+    @rpc
+    def ask_for_mesh(self, name: str) -> tuple[str, int] | None:
+        """The name and size of the file mesh_info answers *name* with, within 10 s."""
+        with self._lock:
+            before = self._counts["mesh_info"]
+        self.mesh_request.publish(String(name))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._counts["mesh_info"] > before:
+                    mesh = self._last["mesh_info"]
+                    return mesh.uri, len(mesh.data)
+            time.sleep(0.1)
+        return None
 
     @rpc
     def drive(self, vx: float, seconds: float) -> None:
@@ -159,11 +192,9 @@ def coordinator(tmp_path: Path):
 def test_drives_and_publishes_every_stream(coordinator: ModuleCoordinator) -> None:
     probe = coordinator.get_instance(Probe)
     deadline = time.monotonic() + 60
-    while time.monotonic() < deadline and len(probe.counts()) < 7:
+    while time.monotonic() < deadline and len(probe.counts()) < len(STREAMS):
         time.sleep(0.5)
-    assert set(probe.counts()) == {
-        "lidar", "color_image", "camera_info", "imu", "odom", "tf", "contacts"
-    }  # fmt: skip
+    assert set(probe.counts()) == set(STREAMS)
     before = probe.counts()
     start = probe.position()
     probe.drive(0.4, 3.0)
@@ -173,3 +204,18 @@ def test_drives_and_publishes_every_stream(coordinator: ModuleCoordinator) -> No
     assert after["color_image"] - before["color_image"] >= 10
     assert probe.position()[0] - start[0] > 0.6
     assert probe.image_spread() > 5  # the red cube, not just background
+
+
+def test_shares_its_urdf_and_each_mesh_it_names(coordinator: ModuleCoordinator) -> None:
+    probe = coordinator.get_instance(Probe)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and "urdf_info" not in probe.counts():
+        time.sleep(0.5)
+    meshes = [m.get("filename") for m in ET.fromstring(probe.urdf()).iter("mesh")]
+    name = meshes[0]
+    assert name.startswith("package://dim_go2_sim/go2/") and "?hash=" in name
+    uri, size = probe.ask_for_mesh(name)
+    assert uri == name and size > 1000
+    digest = name.partition("?hash=")[2]
+    assert probe.ask_for_mesh(f"{name}&have={digest}") is None  # the asker's copy is fresh
+    assert {"base_link", "FL_hip", "FL_thigh", "RR_calf"} <= set(probe.frames())

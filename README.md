@@ -46,8 +46,22 @@ such spawn poses (`dim_go2_sim.interiorgs.load_scene(id).spawns`).
 | `color_image`, `camera_info` | `Image`, `CameraInfo` | the nose camera, RGB |
 | `imu` | `Imu` | body angular velocity, specific force and orientation |
 | `odom` | `PoseStamped` | the true body pose in `world` |
-| `tf` | `TFMessage` | `world` → `base_link` → `mid360_link`, `camera_optical` |
+| `tf` | `TFMessage` | `world` → `base_link` → `mid360_link`, `camera_optical`, and each leg link (`FL_hip` → `FL_thigh` → `FL_calf`, ...) |
 | `contacts` | `dim_go2_sim.Contacts` | (robot part, floor/clutter) pairs touching, whenever they change; ground truth for grading |
+| `urdf_info` | `std_msgs.String` | the robot and its scene as one URDF, every 5 s, for [dim-controller](https://github.com/jeff-hykin/dim-controller) |
+| `mesh_request` (in), `mesh_info` | `std_msgs.String`, `shape_msgs.MeshFile` | a mesh the URDF names, asked for and sent |
+
+### The URDF
+
+As dimOS's `UrdfManager` shares one: each mesh is named
+`package://dim_go2_sim/<path>?hash=<sha256 of the file>`, and that name on `mesh_request` gets
+the file on `mesh_info` (named with its current hash) unless the request ends `&have=<that
+hash>`. The root link is `world`; `base_link` hangs off it by a floating joint and each link is
+posed by its tf frame. The scene is fixed at `world`: `scene_mesh` is its collision surfaces,
+simplified to `urdf.scene_faces` triangles in STL tiles (`scenes/<scene>/mesh_000.stl`, ...),
+and for an InteriorGS home `scene_splats` is its Gaussian splats as one SPZ file
+(`scenes/interiorgs_<id>/splats.spz`, world frame, Z up). The files are built once per scene into
+`physics.cache_dir`. `urdf.enabled=false` turns all of it, and the leg tf, off.
 
 ## Config
 
@@ -61,6 +75,7 @@ such spawn poses (`dim_go2_sim.interiorgs.load_scene(id).spawns`).
   `min_range`, `max_range`, `noise`, `dropout`, `self_occlusion`, `motion_bins_hz`, `seed`
 - `camera`: `enabled`, `rate_hz`, `width`, `height`, `fovy_deg`, `xyz`, `pitch_deg`, `near`,
   `far`, `detail_distance`, `simplify`, `max_texture_size`, `ambient`, `sun`, `background`
+- `urdf`: `enabled`, `period_s`, `scene_faces`, `tile_faces`, `splats_sh_degree`
 - `odom_hz`, `imu_hz`, `frame_prefix`
 
 See `src/dim_go2_sim/config.py` for what each means and its default.

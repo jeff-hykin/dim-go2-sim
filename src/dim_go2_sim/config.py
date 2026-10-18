@@ -93,3 +93,16 @@ class CameraConfig(BaseModel):
     ambient: float = 1.8
     sun: float = 2.5
     background: str = "#1b2230"
+
+
+class UrdfConfig(BaseModel):
+    # The robot and its scene as one URDF on urdf_info, each mesh on mesh_request -> mesh_info, as
+    # dimOS's UrdfManager shares one (for dim-controller); the leg links go on tf too.
+    enabled: bool = True
+    period_s: float = Field(default=5.0, gt=0.0)  # urdf_info is re-sent; nothing is latched
+    # The scene's surfaces are simplified to about this many triangles, in STL files of at most
+    # tile_faces (50 bytes each).
+    scene_faces: int = Field(default=1_000_000, ge=1)
+    tile_faces: int = Field(default=100_000, ge=1)
+    # Spherical-harmonic degree of an InteriorGS home's splats, shared as one SPZ file.
+    splats_sh_degree: int = Field(default=3, ge=0, le=3)
