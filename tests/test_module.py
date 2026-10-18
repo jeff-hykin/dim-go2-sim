@@ -120,6 +120,22 @@ class Probe(Module):
         return None
 
     @rpc
+    def ask_for_urdf(self) -> float | None:
+        """Seconds until urdf_info answers an empty mesh_request, None if mesh_info answers it."""
+        with self._lock:
+            before = dict(self._counts)
+        asked = time.monotonic()
+        self.mesh_request.publish(String(""))
+        while time.monotonic() < asked + 10:
+            with self._lock:
+                if self._counts["mesh_info"] > before.get("mesh_info", 0):
+                    return None
+                if self._counts["urdf_info"] > before.get("urdf_info", 0):
+                    return time.monotonic() - asked
+            time.sleep(0.01)
+        return None
+
+    @rpc
     def drive(self, vx: float, seconds: float) -> None:
         end = time.monotonic() + seconds
         while time.monotonic() < end:
@@ -179,6 +195,7 @@ def coordinator(tmp_path: Path):
             scene={"visual": str(visual)},
             physics={"cache_dir": str(tmp_path / "cache")},
             camera={"width": 160, "height": 120},
+            urdf={"period_s": 60.0},  # only the first send, unless asked
         ),
         Probe.blueprint(),
     )
@@ -219,3 +236,13 @@ def test_shares_its_urdf_and_each_mesh_it_names(coordinator: ModuleCoordinator) 
     digest = name.partition("?hash=")[2]
     assert probe.ask_for_mesh(f"{name}&have={digest}") is None  # the asker's copy is fresh
     assert {"base_link", "FL_hip", "FL_thigh", "RR_calf"} <= set(probe.frames())
+
+
+def test_an_empty_mesh_request_gets_the_urdf_now(coordinator: ModuleCoordinator) -> None:
+    probe = coordinator.get_instance(Probe)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and "urdf_info" not in probe.counts():
+        time.sleep(0.5)
+    time.sleep(0.3)  # past the rate limit of the first send
+    assert probe.ask_for_urdf() < 1.0  # not the 60 s period
+    assert "mesh_info" not in probe.counts()

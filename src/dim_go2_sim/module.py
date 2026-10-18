@@ -71,6 +71,8 @@ logger = setup_logger()
 
 # The optical frame's axes (z forward, x right, y down) as columns, in a forward-looking body frame.
 OPTICAL_IN_BODY = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
+# urdf_info goes out at most this often, however many viewers send an empty mesh_request.
+URDF_MIN_INTERVAL_S = 0.2
 
 
 class Go2SimConfig(ModuleConfig):
@@ -102,7 +104,8 @@ class Go2Sim(Module):
     tf: Out[TFMessage]
     contacts: Out[Contacts]
     # The robot and scene as a URDF, its meshes named package://dim_go2_sim/<path>?hash=<sha256>;
-    # any of those names on mesh_request gets the file on mesh_info, unless it has &have=<sha256>.
+    # any of those names on mesh_request gets the file on mesh_info, unless it has &have=<sha256>;
+    # an empty mesh_request gets urdf_info now, for a viewer that just connected.
     urdf_info: Out[String]
     mesh_request: In[String]
     mesh_info: Out[MeshFile]
@@ -119,6 +122,7 @@ class Go2Sim(Module):
         self._shared_urdf: SharedUrdf | None = None
         self._mesh_requests: list[str] = []
         self._mesh_wanted = threading.Condition()
+        self._urdf_wanted = threading.Event()
 
     @rpc
     def start(self) -> None:
@@ -179,6 +183,7 @@ class Go2Sim(Module):
     @rpc
     def stop(self) -> None:
         self._stop.set()
+        self._urdf_wanted.set()
         with self._mesh_wanted:
             self._mesh_wanted.notify_all()
         for thread in self._threads:
@@ -227,10 +232,16 @@ class Go2Sim(Module):
             f"ready in {time.monotonic() - started:.1f} s"
         )
         while not self._stop.is_set():
+            self._urdf_wanted.clear()
             self.urdf_info.publish(String(shared.xml))
-            self._stop.wait(cfg.urdf.period_s)
+            sent = time.monotonic()
+            self._urdf_wanted.wait(cfg.urdf.period_s)  # an empty mesh_request sends it sooner
+            self._stop.wait(sent + URDF_MIN_INTERVAL_S - time.monotonic())  # however many ask
 
     def _on_mesh_request(self, request: String) -> None:
+        if not request.data:
+            self._urdf_wanted.set()
+            return
         with self._mesh_wanted:
             self._mesh_requests.append(request.data)
             self._mesh_wanted.notify()

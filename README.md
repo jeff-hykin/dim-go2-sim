@@ -78,7 +78,7 @@ to be turned with it. Splats from a 3DGS PLY are drawn as the InteriorGS ones ar
 | `tf` | `TFMessage` | `world` → `base_link` → `mid360_link`, `camera_optical`, and each leg link (`FL_hip` → `FL_thigh` → `FL_calf`, ...) |
 | `contacts` | `dim_go2_sim.Contacts` | (robot part, floor/clutter) pairs touching, whenever they change; ground truth for grading |
 | `urdf_info` | `std_msgs.String` | the robot and its scene as one URDF, every 5 s, for [dim-controller](https://github.com/jeff-hykin/dim-controller) |
-| `mesh_request` (in), `mesh_info` | `std_msgs.String`, `shape_msgs.MeshFile` | a mesh the URDF names, asked for and sent |
+| `mesh_request` (in), `mesh_info` | `std_msgs.String`, `shape_msgs.MeshFile` | a mesh the URDF names, asked for and sent; an empty request gets `urdf_info` right away |
 
 ### The URDF
 
