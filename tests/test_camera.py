@@ -19,7 +19,7 @@ import struct
 
 import numpy as np
 
-from dim_go2_sim.camera import SceneCamera
+from dim_go2_sim.camera import SceneCamera, _cap_textures, _downsampled
 from dim_go2_sim.config import CameraConfig
 
 
@@ -86,3 +86,35 @@ def test_a_sign_a_millimetre_off_a_far_wall_is_drawn_in_front_of_it(tmp_path: Pa
         camera.close()
     sign = rgb[20:28, 28:36].reshape(-1, 3).astype(int)  # the middle of the frame: all sign
     assert (sign[:, 1] > sign[:, 0]).all(), "the wall shows through the sign"
+
+
+def test_a_texture_over_the_cap_is_averaged_down_once_and_stays_shared() -> None:
+    import pygfx as gfx  # type: ignore[import-untyped]
+
+    tall = np.arange(8 * 4 * 4, dtype=np.uint8).reshape(8, 4, 4)
+    shared, small = gfx.Texture(tall, dim=2), gfx.Texture(np.zeros((2, 2, 4), np.uint8), dim=2)
+    root = gfx.Group()
+    for texture in (shared, shared):
+        root.add(gfx.Mesh(gfx.box_geometry(), gfx.MeshBasicMaterial(map=gfx.TextureMap(texture))))
+    standard = gfx.MeshStandardMaterial(
+        map=gfx.TextureMap(small), normal_map=gfx.TextureMap(shared)
+    )
+    root.add(gfx.Mesh(gfx.box_geometry(), standard))
+
+    _cap_textures(gfx, root, 4)
+
+    first, second, third = (mesh.material for mesh in root.children)
+    assert first.map.texture is second.map.texture is third.normal_map.texture
+    assert third.map.texture is small  # already fits: drawn as it was
+    # Only the rows were over the cap; each pair of rows is averaged.
+    expected = np.rint(tall.reshape(4, 2, 4, 4).mean(axis=1)).astype(np.uint8)
+    np.testing.assert_array_equal(first.map.texture.data, expected)
+
+
+def test_downsampling_halves_each_side_until_it_fits_and_drops_an_odd_last_row() -> None:
+    image = np.arange(5 * 9, dtype=np.float32).reshape(5, 9)
+    small = _downsampled(image, 2)
+    # 5 rows: one halving, the fifth dropped; 9 columns: two halvings, the ninth dropped.
+    expected = image[:4, :8].reshape(2, 2, 2, 4).mean(axis=(1, 3))
+    np.testing.assert_allclose(small, expected)
+    assert _downsampled(image, 9) is image

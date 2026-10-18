@@ -74,6 +74,8 @@ class _Renderer:
         root.add(gfx.load_gltf(visual, quiet=True, remote_ok=False).scene)
         if y_up:
             root.local.matrix = Y_UP_TO_Z_UP
+        if config.max_texture_size is not None:
+            _cap_textures(gfx, root, config.max_texture_size)
         self._config = config
         software = gfx.renderers.wgpu.get_shared().adapter.info["adapter_type"] == "CPU"
         reduction = config.simplify
@@ -128,6 +130,57 @@ class _Renderer:
             self._renderer.render(self._scene, camera, clear=not i, flush=False)
         self._renderer.flush()
         return np.ascontiguousarray(np.asarray(self._renderer.snapshot())[:, :, :3])
+
+
+def _cap_textures(gfx: Any, root: Any, max_size: int) -> None:
+    """Every texture map under *root* drawn from a copy no wider or taller than *max_size*."""
+    capped: dict[int, Any] = {}  # by id of the original: materials share textures
+    meshes: list[Any] = []
+    root.traverse(lambda node: meshes.append(node) if isinstance(node, gfx.Mesh) else None)
+    for mesh in meshes:
+        material = mesh.material
+        for name in dir(material):
+            if not name.endswith("map") or name.startswith("_"):
+                continue
+            texture_map = getattr(material, name, None)
+            if not isinstance(texture_map, gfx.TextureMap):
+                continue
+            texture = texture_map.texture
+            if id(texture) not in capped:
+                data = np.asarray(texture.data)
+                small = _downsampled(data, max_size)
+                capped[id(texture)] = texture
+                if small is not data:
+                    capped[id(texture)] = gfx.Texture(
+                        small,
+                        dim=texture.dim,
+                        colorspace=texture.colorspace,
+                        generate_mipmaps=texture._generate_mipmaps,  # glTF's sampler may set it
+                    )
+            texture_map.texture = capped[id(texture)]
+
+
+def _downsampled(data: NDArray[Any], max_size: int) -> NDArray[Any]:
+    """An image's rows and columns halved, each pair averaged, until neither is over *max_size*.
+
+    *data* itself when it already fits. An odd last row or column is dropped.
+    """
+    rows, columns = data.shape[:2]
+    row_factor = column_factor = 1
+    while rows // row_factor > max_size:
+        row_factor *= 2
+    while columns // column_factor > max_size:
+        column_factor *= 2
+    if row_factor == column_factor == 1:
+        return data
+    rows, columns = rows // row_factor, columns // column_factor
+    blocks = data[: rows * row_factor, : columns * column_factor].reshape(
+        rows, row_factor, columns, column_factor, *data.shape[2:]
+    )
+    mean = blocks.mean(axis=(1, 3), dtype=np.float32)
+    if np.issubdtype(data.dtype, np.integer):
+        mean = np.rint(mean)
+    return np.ascontiguousarray(mean.astype(data.dtype))
 
 
 def _simplified(attributes: dict[str, NDArray[Any]], reduction: float) -> dict[str, NDArray[Any]]:

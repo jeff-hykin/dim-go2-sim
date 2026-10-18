@@ -45,7 +45,7 @@ textured glTF the camera draws (`scene.visual`).
 - `lidar`: `enabled`, `rate_hz`, `xyz`, `pitch_deg`, `point_rate_hz`, `downsample`,
   `min_range`, `max_range`, `noise`, `dropout`, `self_occlusion`, `motion_bins_hz`, `seed`
 - `camera`: `enabled`, `rate_hz`, `width`, `height`, `fovy_deg`, `xyz`, `pitch_deg`, `near`,
-  `far`, `detail_distance`, `simplify`, `ambient`, `sun`, `background`
+  `far`, `detail_distance`, `simplify`, `max_texture_size`, `ambient`, `sun`, `background`
 - `odom_hz`, `imu_hz`, `frame_prefix`
 
 See `src/dim_go2_sim/config.py` for what each means and its default.
@@ -67,6 +67,8 @@ See `src/dim_go2_sim/config.py` for what each means and its default.
   e.g. in Docker: install `mesa-vulkan-drivers`) it simplifies the scene and draws small objects
   only within 4 m, to keep a store at several frames a second (`camera.simplify`,
   `camera.detail_distance`).
+  A store's full-size textures overflow an 8 GB GPU; `camera.max_texture_size` (e.g. 2048)
+  halves larger ones until they fit.
 - The composed world is compiled once and cached (`physics.cache_dir`, default
   `~/.cache/dim_go2_sim`); a store takes about 2 minutes the first time.
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SceneConfig(BaseModel):
@@ -83,6 +83,9 @@ class CameraConfig(BaseModel):
     # 4 m and 0.95 on a software one.
     detail_distance: float | None = None
     simplify: float | None = None
+    # Textures wider or taller than this many pixels are halved, by averaging, until they fit:
+    # a store's full-size textures need more memory than an 8 GB GPU has. None keeps them whole.
+    max_texture_size: int | None = Field(default=None, ge=1)
     ambient: float = 1.8
     sun: float = 2.5
     background: str = "#1b2230"
