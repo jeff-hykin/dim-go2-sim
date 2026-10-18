@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 from pathlib import Path
 import threading
@@ -41,6 +42,7 @@ from pydantic import Field
 from reactivex.disposable import Disposable
 from scipy.spatial.transform import Rotation
 
+from dim_go2_sim import interiorgs
 from dim_go2_sim.config import CameraConfig, LidarConfig, PhysicsConfig, SceneConfig
 from dim_go2_sim.contacts import Contacts, ContactSensor
 from dim_go2_sim.lidar import LidarScan, Raycaster, RollingLidar, mount_rotation
@@ -92,14 +94,16 @@ class Go2Sim(Module):
     def start(self) -> None:
         super().start()
         cfg = self.config
-        mjcf, visual, y_up = _resolve_scene(cfg.scene)
-        self.world = Go2World(load_world(mjcf, cfg.physics), cfg.physics)
-        x, y, yaw = cfg.scene.start
-        self.world.reset(x, y, yaw, cfg.scene.floor_z)
+        scene = resolve_scene(cfg.scene, cfg.physics.cache_dir)
+        self.world = Go2World(load_world(scene.mjcf, cfg.physics), cfg.physics)
+        floor_z = scene.floor_z if cfg.scene.floor_z is None else cfg.scene.floor_z
+        x, y, yaw = cfg.scene.start or (scene.spawns[0] if scene.spawns else (0.0, 0.0, 0.0))
+        self.world.reset(x, y, yaw, floor_z)
         model, data = self.world.model, self.world.data
         robot_bodies = {b for b in range(model.nbody) if self.world.is_robot(b)}
+        floor_top_z = floor_z + 0.05 if cfg.scene.floor_top_z is None else cfg.scene.floor_top_z
         self.sensor = ContactSensor(
-            model, data, robot_bodies, self.world.trunk, self.world.feet, cfg.scene.floor_top_z
+            model, data, robot_bodies, self.world.trunk, self.world.feet, floor_top_z
         )
         blocked = [c for c in self.sensor.contacts() if c.kind != "floor"]
         if blocked:
@@ -117,15 +121,18 @@ class Go2Sim(Module):
                 robot_bodies,
                 robot,
                 int(model.jnt_qposadr[model.body_jntadr[self.world.trunk]]),
+                scene.lidar_mesh,
             )
             self._lidar_mount = mount_rotation(cfg.lidar.pitch_deg)
             self._lidar = RollingLidar(cfg.lidar, raycaster, self._lidar_pose)
         self.register_disposable(Disposable(self.cmd_vel.subscribe(self._on_cmd_vel)))
         self._stop.clear()
         self._threads = [threading.Thread(target=self._run, name="go2-sim", daemon=True)]
-        if cfg.camera.enabled and visual is not None:
+        if cfg.camera.enabled and scene.visual is not None:
             self._threads.append(
-                threading.Thread(target=self._run_camera, args=(str(visual), y_up), daemon=True)
+                threading.Thread(
+                    target=self._run_camera, args=(str(scene.visual), scene.y_up), daemon=True
+                )
             )
         for thread in self._threads:
             thread.start()
@@ -286,18 +293,39 @@ class Go2Sim(Module):
             camera.close()
 
 
-def _resolve_scene(scene: SceneConfig) -> tuple[Path | None, Path | None, bool]:
-    """The scene's MJCF, its visual, and whether that is Y-up; from a package or explicit paths."""
+@dataclass(frozen=True)
+class ResolvedScene:
+    mjcf: Path | None
+    visual: Path | None
+    y_up: bool
+    floor_z: float = 0.0
+    spawns: tuple[tuple[float, float, float], ...] = ()  # x, y, yaw
+    # What the lidar casts against in place of the MJCF's static geoms: vertices and faces.
+    lidar_mesh: tuple[NDArray[np.float32], NDArray[np.uint32]] | None = None
+
+
+def resolve_scene(scene: SceneConfig, cache_dir: Path | None = None) -> ResolvedScene:
+    """The scene's files, from a package or explicit paths; an InteriorGS home is downloaded and
+    cooked the first time."""
     if scene.package is None:
-        return scene.mjcf, scene.visual, scene.visual_y_up
+        return ResolvedScene(scene.mjcf, scene.visual, scene.visual_y_up)
+    if (home := interiorgs.scene_id(scene.package)) is not None:
+        cooked = interiorgs.load_scene(home, cache_dir)
+        mesh = np.load(cooked.collision)
+        return ResolvedScene(
+            scene.mjcf or cooked.mjcf,
+            scene.visual or cooked.splats,
+            False,
+            cooked.floor_z,
+            tuple(cooked.spawns),
+            (mesh["vertices"], mesh["faces"]),
+        )
     from dimos.simulation.scenes.catalog import resolve_scene_package
 
     package = resolve_scene_package(scene.package)
     a = package.alignment
     if a.scale != 1 or any(a.translation) or any(a.rotation_zyx_deg):
         raise ValueError(f"{scene.package}: only a Y-up/Z-up alignment is supported")
-    return (
-        scene.mjcf or package.mujoco_scene_path,
-        scene.visual or package.visual_path,
-        a.y_up,
+    return ResolvedScene(
+        scene.mjcf or package.mujoco_scene_path, scene.visual or package.visual_path, a.y_up
     )

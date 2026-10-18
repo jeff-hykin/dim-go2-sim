@@ -23,15 +23,19 @@ from pydantic import BaseModel, Field
 
 
 class SceneConfig(BaseModel):
-    # A cooked dimOS scene package by name (resolved with dimOS's catalog), or explicit files.
+    # A cooked dimOS scene package by name (resolved with dimOS's catalog), an InteriorGS home
+    # as "interiorgs/<id>" (downloaded on first use), or explicit files.
     package: str | None = None
     mjcf: Path | None = None  # collision geometry; a robot-free MJCF
-    visual: Path | None = None  # textured glTF/GLB the camera draws; None draws nothing
+    # What the camera draws: a textured glTF/GLB, or Gaussian splats (.nurec); None draws nothing.
+    visual: Path | None = None
     visual_y_up: bool = True  # glTF's convention; the world is Z-up
-    start: tuple[float, float, float] = (0.0, 0.0, 0.0)  # x, y, yaw of the robot
-    floor_z: float = 0.0  # height the feet start on
+    # x, y, yaw of the robot; None is the scene's first spawn pose, or the origin.
+    start: tuple[float, float, float] | None = None
+    floor_z: float | None = None  # height the feet start on; None is the scene's floor, or 0
     # Scene geometry whose top is below this counts as floor for contacts; the rest is clutter.
-    floor_top_z: float = 0.05
+    # None is 5 cm above floor_z.
+    floor_top_z: float | None = None
 
 
 class PhysicsConfig(BaseModel):

@@ -96,7 +96,9 @@ def static_triangles(
 class Raycaster:
     """The static world through Embree, the robot through MuJoCo; nearest hit wins.
 
-    *robot* is the robot alone, whose qpos is the world's from *robot_qpos* on.
+    *robot* is the robot alone, whose qpos is the world's from *robot_qpos* on. *static_mesh*
+    (world-frame vertices and faces) stands in for the world's static geoms, when a scene's
+    collision geometry is coarser than its surfaces.
     """
 
     def __init__(
@@ -106,8 +108,11 @@ class Raycaster:
         robot_bodies: set[int],
         robot: mujoco.MjModel | None,
         robot_qpos: int,
+        static_mesh: tuple[NDArray[np.float32], NDArray[np.uint32]] | None = None,
     ) -> None:
-        vertices, faces = static_triangles(world, world_data, static_geoms(world, robot_bodies))
+        vertices, faces = static_mesh or static_triangles(
+            world, world_data, static_geoms(world, robot_bodies)
+        )
         self._scene = o3d.t.geometry.RaycastingScene()
         if len(faces):
             self._scene.add_triangles(o3d.core.Tensor(vertices), o3d.core.Tensor(faces))
