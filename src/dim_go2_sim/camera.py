@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Camera frames drawn from a scene's textured glTF with pygfx (after PimSim's mesh renderer).
+"""Camera frames drawn from a scene's textured glTF with pygfx (after PimSim's mesh renderer),
+or from its Gaussian splats (splat.py).
 
 Cooked scenes' MJCFs are collision-only, so MuJoCo would draw grey boxes. Only the static scene
 is drawn, not the robot: a camera must not see its own body. Rendering runs in a fresh child
@@ -33,6 +34,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from dim_go2_sim.config import CameraConfig
+from dim_go2_sim.splat import SplatRenderer, load_nurec
 
 # Most vertices in one merged mesh: 12 bytes each keeps a buffer far under 128 MB.
 MAX_VERTICES = 2_000_000
@@ -340,7 +342,11 @@ def _fan(a: int, b: int, c: int, ab: int | None, bc: int | None, ca: int | None)
 
 
 def _serve(visual: str, y_up: bool, config: CameraConfig) -> None:
-    renderer = _Renderer(visual, y_up, config)
+    renderer: _Renderer | SplatRenderer
+    if visual.endswith(".nurec"):
+        renderer = SplatRenderer(load_nurec(visual), config)
+    else:
+        renderer = _Renderer(visual, y_up, config)
     out = sys.stdout.buffer
     pickle.dump(None, out)
     out.flush()
@@ -356,7 +362,8 @@ def _serve(visual: str, y_up: bool, config: CameraConfig) -> None:
 
 
 class SceneCamera:
-    """Renders *visual* in a child process. Loading a large scene there takes a while."""
+    """Renders *visual* (a glTF, or .nurec splats) in a child process. Loading a large scene there
+    takes a while."""
 
     def __init__(self, visual: str, y_up: bool, config: CameraConfig) -> None:
         self._process = subprocess.Popen(
