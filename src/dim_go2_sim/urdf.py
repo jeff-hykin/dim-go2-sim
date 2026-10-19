@@ -51,7 +51,7 @@ from dim_go2_sim.config import UrdfConfig
 
 PACKAGE = "dim_go2_sim"
 # Bump when the files change, so cached ones are rebuilt.
-ASSETS_VERSION = 1
+ASSETS_VERSION = 2
 SCENE_RGBA = (0.72, 0.72, 0.75, 1.0)
 _MESH_HEADER = struct.Struct("<dI")
 _STL_TRIANGLE = np.dtype([("normal", "<f4", 3), ("vertices", "<f4", (3, 3)), ("attribute", "<u2")])

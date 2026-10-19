@@ -61,7 +61,7 @@ from dim_go2_sim.splat import Splats, load_splats, save_ply
 PREFIX = "supersplat/"
 VIEWER_URL = "https://superspl.at/s?id={id}"
 # Bump when cooking changes, so cooked scenes are rebuilt.
-COOK_VERSION = 4
+COOK_VERSION = 5
 # A streamed SuperSplat scene keeps levels of detail, each half the last; this one (from the
 # finest, 0) is drawn and collided with. The ranch home's is 2.7M splats, 31 MB.
 LOD_LEVEL = 3
@@ -251,10 +251,7 @@ def cook(
     rotation, floor = levelling(splats)
     world = transformed(splats, rotation, floor, scale)
     save_ply(world, folder / "splats.ply")
-    occupied, origin = voxelize(world)
-    clear(occupied, origin, edits.cleared)
-    clear(occupied, origin, edits.added, solid=True)
-    drop_floaters(occupied)
+    occupied, origin = occupancy(world, edits)
     boxes = merged_boxes(occupied[:, :, : math.ceil(COLLISION_HEIGHT / VOXEL)])
     (folder / "scene.xml").write_text(mjcf(boxes, origin, 0.0, name))
     has_floor = floor_cells(world, occupied.shape[:2], origin)
@@ -268,6 +265,17 @@ def cook(
         "rotation": rotation.tolist(),
         "floor": floor,
     }
+
+
+def occupancy(
+    world: Splats, edits: Edits = NO_EDITS
+) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
+    """The solid voxels of levelled, scaled *world* with *edits* applied, and the grid's corner."""
+    occupied, origin = voxelize(world)
+    clear(occupied, origin, edits.cleared)
+    clear(occupied, origin, edits.added, solid=True)
+    drop_floaters(occupied)
+    return occupied, origin
 
 
 def _normals(splats: Splats) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
@@ -466,8 +474,11 @@ def surface_mesh(
         for side in (0, 1):
             neighbour = np.roll(padded, -1 if side else 1, axis=axis)[1:-1, 1:-1, 1:-1]
             cells = np.argwhere(occupied & ~neighbour).astype(np.float64)
-            # The face's four corners, in the cell's unit cube.
-            u, v = [a for a in range(3) if a != axis]
+            # The face's four corners, in the cell's unit cube, counter-clockwise seen from outside
+            # (u, v, axis right-handed): renderers cull a face from behind, and STL's normal is it.
+            u, v = (axis + 1) % 3, (axis + 2) % 3
+            if not side:
+                u, v = v, u
             corners = np.zeros((4, 3))
             corners[:, axis] = side
             corners[:, u] = (0, 1, 1, 0)

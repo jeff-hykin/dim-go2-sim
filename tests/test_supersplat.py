@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 import json
 import math
 import os
@@ -628,3 +629,85 @@ def test_the_camera_sees_a_room_from_a_ranch_spawn(ranch: supersplat.ScanScene) 
     lower = rgb[60:].astype(int)
     assert (np.abs(lower - background).sum(axis=2) > 30).mean() > 0.95, "gaps"
     assert rgb.std() > 20, "a blur, not a room"
+
+
+_DIRECTIONS = {
+    f"{s}{a}": (i, sign) for i, a in enumerate("xyz") for s, sign in (("+", 1), ("-", -1))
+}
+
+
+def _winding_faults(
+    triangles: NDArray[np.float32],
+    normals: NDArray[np.float32],
+    solid: Callable[[NDArray[np.float64]], NDArray[np.bool_]],
+) -> dict[str, tuple[int, int]]:
+    """Per outward direction (+x ... -z, told by which side of each triangle is solid): how many
+    triangles face it, and how many of those are wound (or carry an STL normal) the other way."""
+    corners = triangles.astype(np.float64)
+    wound = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    wound /= np.linalg.norm(wound, axis=1, keepdims=True)
+    centre = corners.mean(axis=1)
+    axis = np.argmax(np.abs(wound), axis=1)
+    step = np.zeros_like(wound)
+    step[np.arange(len(step)), axis] = 1e-3
+    above, below = solid(centre + step), solid(centre - step)
+    assert (above != below).all(), f"{(above == below).sum()} triangles aren't on a solid's surface"
+    outward = np.where(below, 1, -1)  # sign along +axis of the solid's outside
+    faulty = (np.sign(wound[np.arange(len(wound)), axis]) != outward) | (
+        np.einsum("ij,ij->i", wound, normals) < 0.99
+    )
+    return {
+        name: (int(n.sum()), int((n & faulty).sum()))
+        for name, (i, sign) in _DIRECTIONS.items()
+        for n in [(axis == i) & (outward == sign)]
+    }
+
+
+def _read_stl_normals(data: bytes) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    count = int.from_bytes(data[80:84], "little")
+    records = np.frombuffer(data[84 : 84 + 50 * count], np.dtype([("f", "<f4", 12), ("a", "<u2")]))
+    return records["f"][:, 3:].reshape(-1, 3, 3), records["f"][:, :3]
+
+
+def _published(vertices: NDArray, faces: NDArray, folder: Path) -> tuple[NDArray, NDArray]:
+    """The scene's triangles and STL normals as share_urdf publishes them."""
+    from dim_go2_sim.config import UrdfConfig
+    from dim_go2_sim.urdf import SceneSource, _write_scene
+
+    _write_scene(SceneSource("s", "", lambda: (vertices, faces)), UrdfConfig(), folder)
+    tiles = [_read_stl_normals(p.read_bytes()) for p in sorted(folder.glob("mesh_*.stl"))]
+    return np.concatenate([t for t, _ in tiles]), np.concatenate([n for _, n in tiles])
+
+
+def _voxel_solid(occupied: NDArray[np.bool_], origin: NDArray[np.float64]):
+    def solid(points: NDArray[np.float64]) -> NDArray[np.bool_]:
+        cell = np.floor((points - origin) / supersplat.VOXEL).astype(np.int64)
+        inside = (cell >= 0).all(axis=1) & (cell < occupied.shape).all(axis=1)
+        result = points[:, 2] < 0  # under the floor
+        result[inside] |= occupied[tuple(cell[inside].T)]
+        return result
+
+    return solid
+
+
+def test_a_box_s_published_faces_all_face_out(tmp_path: Path) -> None:
+    occupied = np.zeros((8, 8, 8), bool)
+    occupied[2:5, 3:7, 1:4] = True
+    origin = np.array([-1.0, 2.0, 0.06])
+    floor = np.zeros((8, 8), bool)
+    floor[1:7, 1:7] = True
+    triangles, normals = _published(*supersplat.surface_mesh(occupied, origin, floor), tmp_path)
+    faults = _winding_faults(triangles, normals, _voxel_solid(occupied, origin))
+    assert all(n > 0 for n, _ in faults.values()), faults
+    assert all(bad == 0 for _, bad in faults.values()), faults
+
+
+def test_every_published_ranch_face_faces_out_of_its_solid(
+    ranch: supersplat.ScanScene, tmp_path: Path
+) -> None:
+    occupied, origin = supersplat.occupancy(load_ply(ranch.splats), supersplat.bundled_edits(RANCH))
+    mesh = np.load(ranch.collision)
+    triangles, normals = _published(mesh["vertices"], mesh["faces"], tmp_path)
+    faults = _winding_faults(triangles, normals, _voxel_solid(occupied, origin))
+    assert all(n > 0 for n, _ in faults.values()), faults
+    assert all(bad == 0 for _, bad in faults.values()), faults
