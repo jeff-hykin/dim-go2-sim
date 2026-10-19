@@ -7,28 +7,20 @@ out. It drops into a blueprint where a real Go2 would be.
 ## Quick start
 
 ```bash
-pip install dim-go2-sim "dimos[visualization,web]" matplotlib  # dimos 0.0.14's viewer needs all three
+pip install dim-go2-sim
 ```
 
-[`examples/drive.py`](https://github.com/jeff-hykin/dim-go2-sim/blob/main/examples/drive.py) walks the Go2 around a scanned ranch home:
+[`examples/drive.py`](https://github.com/jeff-hykin/dim-go2-sim/blob/main/examples/drive.py) puts the Go2 in a scanned ranch home:
 
 ```python
 import sys
 
 from dimos.core.coordination.blueprint_config.parser import BlueprintConfigParser
-from dimos.core.coordination.blueprints import autoconnect
 from dimos.core.coordination.module_coordinator import ModuleCoordinator
-from dimos.core.global_config import global_config
-from dimos.navigation.movement_manager.movement_manager import MovementManager
-from dimos.visualization.vis_module import vis_module
 
 from dim_go2_sim import Go2Sim
 
-drive = autoconnect(
-    Go2Sim.blueprint(scene={"package": "supersplat/3f89bbd3"}),  # the ranch home
-    vis_module(viewer_backend=global_config.viewer),  # dimos-viewer: its WASD -> tele_cmd_vel
-    MovementManager.blueprint(),  # tele_cmd_vel (and a planner's nav_cmd_vel) -> cmd_vel
-)
+drive = Go2Sim.blueprint(scene={"package": "supersplat/3f89bbd3"}).global_config(transport="zenoh")
 
 if __name__ == "__main__":
     ModuleCoordinator.build(drive, BlueprintConfigParser(drive).parse(sys.argv[1:])).loop()
@@ -38,12 +30,10 @@ if __name__ == "__main__":
 python examples/drive.py
 ```
 
-The first run downloads and cooks the scan (31 MB, under a minute). Then dimos-viewer opens on the
-lidar sweeping the house, the nose camera and the robot's tf, and its WASD keys walk the robot.
-The sim publishes lidar at 10 Hz, the camera at ~9 fps on an M-series Mac, and
-odom at 50 Hz. In your own blueprint, anything that writes `cmd_vel` drives it (a planner into
-`MovementManager`'s `nav_cmd_vel`, or `Go2Sim`'s `cmd_vel` directly). dimos's `KeyboardTeleop`
-pygame window works on Linux, but crashes on macOS (pygame opens its window off the main thread).
+The first run downloads and cooks the scan (31 MB, under a minute). Then the sim publishes lidar at
+10 Hz, the nose camera at ~9 fps on an M-series Mac, odom at 50 Hz and tf over zenoh, and walks
+wherever `cmd_vel` says: drive it from dimOS Desktop's Controller app, or add a planner or teleop
+module to the blueprint with `autoconnect`.
 
 ## Scenes
 
