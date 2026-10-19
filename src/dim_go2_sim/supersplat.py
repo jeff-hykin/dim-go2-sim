@@ -24,9 +24,12 @@ cooking it:
   (their feet are often thin in a scan), and the voxels from just above
   the floor to COLLISION_HEIGHT merged into boxes for MuJoCo, over a floor plane; the lidar casts
   against the voxels' outer faces, at every height, and the floor under the scan;
-- clears the scene's cleared regions (boxes marked by hand where the scan's noise or furniture
-  undersides block open floor) of voxels before any of that is built from them; the splats are
-  drawn as they are.
+- applies the scene's edits (boxes marked by hand) before any of that is built from them: its
+  cleared regions (where the scan's noise or furniture undersides block open floor) are emptied of
+  voxels, and its added solids (walls the scan left ragged) filled; the splats are drawn as they
+  are;
+- floors the house: the lidar's and shared mesh's floor covers every column inside the scan's
+  walls, not just those the scan saw floor in.
 """
 
 from __future__ import annotations
@@ -58,7 +61,7 @@ from dim_go2_sim.splat import Splats, load_splats, save_ply
 PREFIX = "supersplat/"
 VIEWER_URL = "https://superspl.at/s?id={id}"
 # Bump when cooking changes, so cooked scenes are rebuilt.
-COOK_VERSION = 2
+COOK_VERSION = 3
 # A streamed SuperSplat scene keeps levels of detail, each half the last; this one (from the
 # finest, 0) is drawn and collided with. The ranch home's is 2.7M splats, 31 MB.
 LOD_LEVEL = 3
@@ -82,9 +85,22 @@ MIN_PATCH = 30
 WALL_SPAN = 0.6  # metres
 # Splats lower than this above the floor are the floor's (the scan's floor is a few cm thick).
 FLOOR_CLEARANCE = 0.06
+# Gaps in the walls narrower than this (doorways, windows) are closed to find the house's floor.
+DOORWAY = 1.2  # metres
 
 
 Region = tuple[float, float, float, float, float, float]  # xmin, ymin, zmin, xmax, ymax, zmax
+
+
+@dataclass(frozen=True)
+class Edits:
+    """A scene's hand edits to its collision voxels, as world-frame boxes in metres."""
+
+    cleared: tuple[Region, ...] = ()  # emptied of voxels
+    added: tuple[Region, ...] = ()  # filled with voxels, after the clearing
+
+
+NO_EDITS = Edits()
 
 
 @dataclass(frozen=True)
@@ -112,14 +128,13 @@ def load_scene(
     scene: str,
     cache_dir: Path | None = None,
     scale: float | None = None,
-    cleared: Path | None = None,
+    edits: Path | None = None,
 ) -> ScanScene:
-    """SuperSplat scene *scene*, downloaded (~30 MB) and cooked the first time; its voxels in the
-    regions listed in *cleared* (a JSON file, see cleared_regions) are cleared, by default those
-    shipped for the scene."""
+    """SuperSplat scene *scene*, downloaded (~30 MB) and cooked the first time, with the edits in
+    *edits* (a JSON file, see scene_edits), by default those shipped for the scene."""
     folder = _cache(cache_dir) / "supersplat" / scene
     scale = scale or SCALES.get(scene, 1.0)
-    regions = cleared_regions(cleared) if cleared is not None else bundled_cleared_regions(scene)
+    regions = scene_edits(edits) if edits is not None else bundled_edits(scene)
 
     def splats() -> Splats:
         meta = _download_sog(scene, folder / "sog")
@@ -129,44 +144,49 @@ def load_scene(
 
 
 def load_scan(
-    path: Path, cache_dir: Path | None = None, scale: float = 1.0, cleared: Path | None = None
+    path: Path, cache_dir: Path | None = None, scale: float = 1.0, edits: Path | None = None
 ) -> ScanScene:
-    """A local scan (a 3DGS PLY or SOG meta.json), cooked the first time, its voxels in the
-    regions listed in *cleared* cleared."""
+    """A local scan (a 3DGS PLY or SOG meta.json), cooked the first time, with the edits in
+    *edits*."""
     path = Path(path).resolve()
     stat = path.stat()
     key = hashlib.sha256(f"{path} {stat.st_size} {stat.st_mtime_ns}".encode()).hexdigest()[:12]
     folder = _cache(cache_dir) / "scans" / f"{path.stem}-{key}"
-    regions = cleared_regions(cleared) if cleared is not None else []
+    regions = scene_edits(edits) if edits is not None else Edits()
     return _cooked(folder, path.stem, scale, lambda: load_splats(path), regions)
 
 
-def cleared_regions(path: Path) -> list[Region]:
-    """The world-frame boxes in a cleared-regions file: JSON {"note": where they came from,
-    "boxes": [[xmin, ymin, zmin, xmax, ymax, zmax], ...]}, in metres."""
-    return [tuple(map(float, b)) for b in json.loads(Path(path).read_text())["boxes"]]  # type: ignore[misc]
+def scene_edits(path: Path) -> Edits:
+    """The boxes in an edits file: JSON {"edits": [{"note": who marked them, when and why,
+    "cleared": [[xmin, ymin, zmin, xmax, ymax, zmax], ...], "added": [...]}, ...]}, world-frame,
+    in metres. A file may also be one such group."""
+    data = json.loads(Path(path).read_text())
+    groups = data.get("edits", [data])
+
+    def boxes(key: str) -> tuple[Region, ...]:
+        return tuple(tuple(map(float, b)) for g in groups for b in g.get(key, []))  # type: ignore[misc]
+
+    return Edits(boxes("cleared"), boxes("added"))
 
 
-def bundled_cleared_regions(scene: str) -> list[Region]:
-    """The cleared regions shipped for SuperSplat scene *scene*, if any."""
-    bundled = files("dim_go2_sim") / f"data/supersplat/{scene}_cleared.json"
-    return cleared_regions(Path(str(bundled))) if bundled.is_file() else []
+def bundled_edits(scene: str) -> Edits:
+    """The edits shipped for SuperSplat scene *scene*, if any."""
+    bundled = files("dim_go2_sim") / f"data/supersplat/{scene}_edits.json"
+    return scene_edits(Path(str(bundled))) if bundled.is_file() else Edits()
 
 
-def _cooked(
-    folder: Path, name: str, scale: float, splats: object, cleared: list[Region]
-) -> ScanScene:
+def _cooked(folder: Path, name: str, scale: float, splats: object, edits: Edits) -> ScanScene:
     info_path = folder / "scene.json"
     info = json.loads(info_path.read_text()) if info_path.is_file() else {}
-    cleared_key = hashlib.sha256(json.dumps(cleared).encode()).hexdigest()[:16]
+    edits_key = hashlib.sha256(json.dumps([edits.cleared, edits.added]).encode()).hexdigest()[:16]
     if (
         info.get("cook_version") != COOK_VERSION
         or info.get("scale") != scale
-        or info.get("cleared") != cleared_key
+        or info.get("edits") != edits_key
     ):
         folder.mkdir(parents=True, exist_ok=True)
-        info = cook(splats(), folder, name, scale, cleared)  # type: ignore[operator]
-        info["cleared"] = cleared_key
+        info = cook(splats(), folder, name, scale, edits)  # type: ignore[operator]
+        info["edits"] = edits_key
         info_path.write_text(json.dumps(info))
     return ScanScene(
         mjcf=folder / "scene.xml",
@@ -224,19 +244,20 @@ def _concatenated(parts: list[Splats]) -> Splats:
 
 
 def cook(
-    splats: Splats, folder: Path, name: str, scale: float, cleared: Sequence[Region] = ()
+    splats: Splats, folder: Path, name: str, scale: float, edits: Edits = NO_EDITS
 ) -> dict[str, object]:
-    """Levels, scales and voxelises *splats*, clearing the *cleared* regions of voxels; writes the
-    scene's files into *folder*."""
+    """Levels, scales and voxelises *splats*, with *edits*; writes the scene's files into
+    *folder*."""
     rotation, floor = levelling(splats)
     world = transformed(splats, rotation, floor, scale)
     save_ply(world, folder / "splats.ply")
     occupied, origin = voxelize(world)
-    clear(occupied, origin, cleared)
+    clear(occupied, origin, edits.cleared)
+    clear(occupied, origin, edits.added, solid=True)
     boxes = merged_boxes(occupied[:, :, : math.ceil(COLLISION_HEIGHT / VOXEL)])
     (folder / "scene.xml").write_text(mjcf(boxes, origin, 0.0, name))
     has_floor = floor_cells(world, occupied.shape[:2], origin)
-    vertices, faces = surface_mesh(occupied, origin, has_floor)
+    vertices, faces = surface_mesh(occupied, origin, house_floor(has_floor, occupied))
     np.savez(folder / "collision.npz", vertices=vertices, faces=faces)
     spawns = open_floor_spawns(has_floor, occupied, origin)
     return {
@@ -375,10 +396,14 @@ def voxelize(splats: Splats) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
 
 
 def clear(
-    occupied: NDArray[np.bool_], origin: NDArray[np.float64], regions: Sequence[Region]
+    occupied: NDArray[np.bool_],
+    origin: NDArray[np.float64],
+    regions: Sequence[Region],
+    solid: bool = False,
 ) -> None:
-    """Empties, in place, every voxel whose centre is inside one of *regions*, padded by just under
-    half a voxel: a region drawn on voxel faces (to the mm) takes the voxels it bounds, no more."""
+    """Empties (or, if *solid*, fills), in place, every voxel whose centre is inside one of
+    *regions*, padded by just under half a voxel: a region drawn on voxel faces (to the mm) takes
+    the voxels it bounds, no more; one thinner than a voxel still takes a layer of them."""
     pad = 0.4 * VOXEL
     for region in regions:
         low = np.array(region[:3]) - pad
@@ -388,7 +413,7 @@ def clear(
         last = np.minimum(np.floor((high - origin) / VOXEL - 0.5), np.array(occupied.shape) - 1)
         last = last.astype(int)
         if (last >= first).all():
-            occupied[first[0] : last[0] + 1, first[1] : last[1] + 1, first[2] : last[2] + 1] = False
+            occupied[first[0] : last[0] + 1, first[1] : last[1] + 1, first[2] : last[2] + 1] = solid
 
 
 def floor_cells(
@@ -408,10 +433,22 @@ def floor_cells(
     return ndimage.binary_fill_holes(has_floor)
 
 
+def house_floor(has_floor: NDArray[np.bool_], occupied: NDArray[np.bool_]) -> NDArray[np.bool_]:
+    """Grid columns inside the house: the scan's floor, and everything its walls (any solid
+    column), their doorways closed, enclose; a scan often sees no floor down a dim hallway."""
+    from scipy import ndimage
+
+    reach = round(DOORWAY / VOXEL / 2)
+    walls = np.pad(has_floor | occupied.any(axis=2), reach)
+    closed = ndimage.binary_closing(walls, iterations=reach)[reach:-reach, reach:-reach]
+    return ndimage.binary_fill_holes(closed) | has_floor
+
+
 def surface_mesh(
     occupied: NDArray[np.bool_], origin: NDArray[np.float64], has_floor: NDArray[np.bool_]
 ) -> tuple[NDArray[np.float32], NDArray[np.uint32]]:
-    """The solid voxels' outer faces, and a quad of floor (z = 0) over each floor column."""
+    """The solid voxels' outer faces, and the floor (z = 0) over the floor columns, as few
+    rectangles as cover them."""
     quads = []
     padded = np.pad(occupied, 1)
     for axis in range(3):
@@ -425,9 +462,10 @@ def surface_mesh(
             corners[:, u] = (0, 1, 1, 0)
             corners[:, v] = (0, 0, 1, 1)
             quads.append(origin + (cells[:, None, :] + corners) * VOXEL)
-    cells = np.argwhere(has_floor).astype(np.float64)
-    floor = np.zeros((len(cells), 4, 3))
-    floor[:, :, :2] = origin[:2] + (cells[:, None, :] + [(0, 0), (1, 0), (1, 1), (0, 1)]) * VOXEL
+    rectangles = merged_boxes(has_floor[:, :, None])[:, [0, 1, 3, 4]].astype(np.float64)
+    floor = np.zeros((len(rectangles), 4, 3))
+    for k, (a, b) in enumerate([(0, 1), (2, 1), (2, 3), (0, 3)]):
+        floor[:, k, :2] = origin[:2] + rectangles[:, [a, b]] * VOXEL
     quads.append(floor)
     corners = np.concatenate(quads).reshape(-1, 3).astype(np.float32)
     first = np.arange(0, len(corners), 4, dtype=np.uint32)[:, None, None]

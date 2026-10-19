@@ -487,12 +487,10 @@ def resolve_scene(scene: SceneConfig, cache_dir: Path | None = None) -> Resolved
     home = supersplat.scene_id(scene.package) if scene.package else None
     if scene.scan is not None or home is not None:
         if home is not None:
-            scan = supersplat.load_scene(home, cache_dir, scene.scan_scale, scene.cleared)
+            scan = supersplat.load_scene(home, cache_dir, scene.scan_scale, scene.edits)
             name = f"supersplat_{home}"
         else:
-            scan = supersplat.load_scan(
-                scene.scan, cache_dir, scene.scan_scale or 1.0, scene.cleared
-            )
+            scan = supersplat.load_scan(scene.scan, cache_dir, scene.scan_scale or 1.0, scene.edits)
             name = f"scan_{scan.splats.parent.name}"
         mesh = np.load(scan.collision)
         visual = scene.visual or scan.splats

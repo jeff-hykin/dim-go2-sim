@@ -39,6 +39,10 @@ RANCH = "3f89bbd3"
 # centre keeps from anything in its way (half its width, and a little).
 BOTTOM_BEDROOMS = {"south-west": (0.0, -9.0), "south-east": (4.5, -9.0)}
 DOG_CLEARANCE = 0.17
+# The north-south hallway from the dining area down to the bottom bedrooms: its walls' faces
+# (x), and its ends (y), as the scan has them.
+HALLWAY_WALLS = (2.33, 3.28)
+HALLWAY_ENDS = (-3.58, -6.88)
 
 
 def splats(positions: np.ndarray, normals: np.ndarray, sigma: float = 0.02) -> Splats:
@@ -220,8 +224,45 @@ def test_a_cleared_region_empties_the_voxels_inside_it_and_no_others(tmp_path: P
     expected[tuple(i[cube].T)] = False
     assert cube.sum() > 100 and (occupied == expected).all()
     # Cooked with the whole room cleared, only the floor is left to collide with.
-    supersplat.cook(room_scan(), tmp_path, "room", 1.0, [(-9, -9, -9, 9, 9, 9)])
+    supersplat.cook(room_scan(), tmp_path, "room", 1.0, supersplat.Edits(((-9, -9, -9, 9, 9, 9),)))
     assert np.load(tmp_path / "collision.npz")["vertices"][:, 2].max() == 0.0
+
+
+def test_an_added_solid_fills_the_voxels_inside_it_even_where_it_is_cleared(
+    tmp_path: Path,
+) -> None:
+    room = room_scan()
+    wall = (2.0, 0.5, 0.0, 2.1, 3.5, 1.5)  # thinner than two voxels, across the open floor
+    edits = supersplat.Edits(cleared=((1.5, 0.0, 0.0, 2.5, 4.0, 2.0),), added=(wall,))
+    supersplat.cook(room, tmp_path, "room", 1.0, edits)
+    boxes = np.array(
+        [
+            [float(n) for n in g.get("pos").split() + g.get("size").split()]
+            for g in ElementTree.parse(tmp_path / "scene.xml").iter("geom")
+            if g.get("type") == "box"
+        ]
+    )
+    # The cooked room is centred: find the wall by its length along y, where nothing else is.
+    low, high = boxes[:, :3] - boxes[:, 3:], boxes[:, :3] + boxes[:, 3:]
+    long = boxes[(high[:, 1] - low[:, 1] > 2.5) & (high[:, 2] - low[:, 2] > 1.0)]
+    assert len(long) >= 1, "the added wall isn't a box"
+    thickness = 2 * long[:, 3].sum()
+    assert supersplat.VOXEL <= thickness <= 3 * supersplat.VOXEL
+
+
+def test_the_floor_covers_the_whole_house_as_a_few_rectangles(tmp_path: Path) -> None:
+    room = room_scan()
+    # A room whose scan saw no floor in its middle (a dim hallway) is floored all the same.
+    keep = ~((np.abs(room.positions[:, 2]) < 0.03) & (np.abs(room.positions[:, 0] - 3) < 1.5))
+    fields = ("positions", "rotations", "log_scales", "opacities", "sh")
+    supersplat.cook(Splats(*(getattr(room, f)[keep] for f in fields)), tmp_path, "r", 1.0)
+    mesh = np.load(tmp_path / "collision.npz")
+    triangles = mesh["vertices"][mesh["faces"]]
+    floor = triangles[(np.abs(triangles[:, :, 2]) < 1e-6).all(axis=1)]
+    area = 0.5 * np.abs(np.cross(floor[:, 1] - floor[:, 0], floor[:, 2] - floor[:, 0])[:, 2])
+    span = floor[:, :, :2].reshape(-1, 2)
+    assert area.sum() >= 0.95 * np.prod(span.max(axis=0) - span.min(axis=0)), "holes"
+    assert len(floor) < 100, f"{len(floor)} floor triangles"
 
 
 def _ranch_boxes(ranch: supersplat.ScanScene) -> NDArray[np.float64]:
@@ -243,12 +284,10 @@ def _ranch_grid(
     v = supersplat.VOXEL
     boxes = _ranch_boxes(ranch)
     mesh = np.load(ranch.collision)
-    triangles = mesh["vertices"][mesh["faces"]]
-    floor = triangles[(np.abs(triangles[:, :, 2]) < 1e-6).all(axis=1)].mean(axis=1)[:, :2]
-    low = np.minimum(floor.min(axis=0), (boxes[:, :2] - boxes[:, 3:5]).min(axis=0)) - 1
-    shape = tuple(np.ceil((floor.max(axis=0) - low) / v).astype(int) + 40)
-    has_floor = np.zeros(shape, bool)
-    has_floor[tuple(np.floor((floor - low) / v).astype(int).T)] = True
+    floor_low, has_floor = _floor_grid(mesh["vertices"], mesh["faces"])
+    low = np.minimum(floor_low, (boxes[:, :2] - boxes[:, 3:5]).min(axis=0)) - 1
+    shape = tuple(np.round((floor_low - low) / v).astype(int) + has_floor.shape + 40)
+    has_floor = _floor_grid(mesh["vertices"], mesh["faces"], low, shape)[1]
     blocked = np.zeros(shape, bool)
     for x, y, _, sx, sy, _ in boxes[boxes[:, 2] - boxes[:, 5] < ROBOT_HEIGHT]:
         a = np.round((np.array([x - sx, y - sy]) - low) / v).astype(int)
@@ -257,13 +296,115 @@ def _ranch_grid(
     return low, has_floor, blocked
 
 
+def _floor_grid(
+    vertices: NDArray[np.float32],
+    faces: NDArray[np.uint32],
+    low: NDArray[np.float64] | None = None,
+    shape: tuple[int, ...] | None = None,
+) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+    """The VOXEL columns under the level triangles at z = 0 (the floor's rectangles, each two
+    triangles that span it), on a grid from *low* (by default the floor's corner)."""
+    v = supersplat.VOXEL
+    triangles = vertices[faces]
+    floor = triangles[(np.abs(triangles[:, :, 2]) < 1e-6).all(axis=1)][:, :, :2]
+    if low is None:
+        low = floor.reshape(-1, 2).min(axis=0)
+    if shape is None:
+        shape = tuple(np.ceil((floor.reshape(-1, 2).max(axis=0) - low) / v).astype(int))
+    has_floor = np.zeros(shape, bool)
+    for a, b in zip(floor.min(axis=1), floor.max(axis=1), strict=True):
+        i, j = np.round((a - low) / v).astype(int), np.round((b - low) / v).astype(int)
+        has_floor[i[0] : j[0], i[1] : j[1]] = True
+    return low, has_floor
+
+
 def test_the_ranch_cleared_regions_are_open(ranch: supersplat.ScanScene) -> None:
-    regions = np.array(supersplat.bundled_cleared_regions(RANCH))
-    assert len(regions) > 0
+    edits = supersplat.bundled_edits(RANCH)
+    regions, added = np.array(edits.cleared), np.array(edits.added)
+    assert len(regions) > 0 and len(added) > 0
     centres = (regions[:, :3] + regions[:, 3:]) / 2
+    # A region an added solid walls over again is solid.
+    walled = (centres[:, None] > added[None, :, :3]) & (centres[:, None] < added[None, :, 3:])
+    centres = centres[~walled.all(axis=2).any(axis=1)]
     boxes = _ranch_boxes(ranch)
     inside = (np.abs(centres[:, None, :] - boxes[None, :, :3]) < boxes[None, :, 3:]).all(axis=2)
     assert not inside.any(), f"{inside.any(axis=1).sum()} cleared regions still collide"
+
+
+def test_the_ranch_hallway_is_clear_wall_to_wall(ranch: supersplat.ScanScene) -> None:
+    from scipy import ndimage
+
+    v = supersplat.VOXEL
+    low, has_floor, blocked = _ranch_grid(ranch)
+    room = ndimage.distance_transform_edt(has_floor & ~blocked) * v >= DOG_CLEARANCE
+    # The robot's centre fits anywhere a voxel more than DOG_CLEARANCE from either wall.
+    left, right = HALLWAY_WALLS[0] + DOG_CLEARANCE + v, HALLWAY_WALLS[1] - DOG_CLEARANCE - v
+    for x in np.arange(left, right, v):
+        for y in np.arange(HALLWAY_ENDS[0] - 0.1, HALLWAY_ENDS[1] - 0.1, -v):
+            cell = tuple(np.floor((np.array([x, y]) - low) / v).astype(int))
+            assert room[cell], f"the hallway is blocked at ({x:.2f}, {y:.2f})"
+
+
+def test_the_go2_walks_straight_down_the_ranch_hallway(ranch: supersplat.ScanScene) -> None:
+    physics = PhysicsConfig(realtime=False)
+    world = Go2World(load_world(ranch.mjcf, physics), physics)
+    robot = {b for b in range(world.model.nbody) if world.is_robot(b)}
+    sensor = ContactSensor(world.model, world.data, robot, world.trunk, world.feet, 0.05)
+    middle = sum(HALLWAY_WALLS) / 2
+    world.reset(middle, HALLWAY_ENDS[0] + 0.2, -math.pi / 2, ranch.floor_z)
+    touched = set()
+    for _ in range(600):
+        position, rotation = world.base_pose()
+        if position[1] < HALLWAY_ENDS[1] - 0.2:
+            break
+        yaw = math.atan2(rotation[1, 0], rotation[0, 0])
+        # Straight south, held to the middle as a driver would.
+        steer = -2.0 * (yaw + math.pi / 2) - 2.0 * (middle - position[0])
+        world.tick(np.array([0.5, 0.0, steer]))
+        touched.update(sensor.contacts())
+    assert position[1] < HALLWAY_ENDS[1] - 0.2, f"stopped at {position[:2].round(2)}"
+    assert touched <= {Contact("foot", "floor")}, touched
+
+
+def test_a_ray_across_the_ranch_hallway_hits_its_walls(ranch: supersplat.ScanScene) -> None:
+    import open3d as o3d
+
+    mesh = np.load(ranch.collision)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.core.Tensor(mesh["vertices"]), o3d.core.Tensor(mesh["faces"]))
+    middle = sum(HALLWAY_WALLS) / 2
+    ys = np.linspace(HALLWAY_ENDS[1] + 0.3, -4.8, 12)
+    rays = [[middle, y, z, d, 0, 0] for y in ys for z in (0.3, 1.0, 1.7) for d in (-1, 1)]
+    hits = scene.cast_rays(o3d.core.Tensor(np.array(rays, np.float32)))["t_hit"].numpy()
+    wall = np.array([middle - HALLWAY_WALLS[0], HALLWAY_WALLS[1] - middle] * (len(rays) // 2))
+    assert np.abs(hits - wall).max() < supersplat.VOXEL, np.abs(hits - wall).max()
+
+
+def test_the_ranch_floor_is_shared_down_the_hallway(
+    ranch: supersplat.ScanScene, tmp_path: Path
+) -> None:
+    from dim_go2_sim.config import UrdfConfig
+    from dim_go2_sim.urdf import SceneSource, _write_scene
+
+    mesh = np.load(ranch.collision)
+    source = SceneSource("ranch", "", lambda: (mesh["vertices"], mesh["faces"]))
+    _write_scene(source, UrdfConfig(), tmp_path)
+    tiles = [_read_stl(path.read_bytes()) for path in sorted(tmp_path.glob("mesh_*.stl"))]
+    vertices = np.concatenate([t.reshape(-1, 3) for t in tiles])
+    faces = np.arange(len(vertices), dtype=np.uint32).reshape(-1, 3)
+    low = np.array([HALLWAY_WALLS[0], HALLWAY_ENDS[1]])
+    shape = tuple(
+        np.floor((np.array([HALLWAY_WALLS[1], HALLWAY_ENDS[0]]) - low) / 0.05).astype(int)
+    )
+    covered = _floor_grid(vertices, faces, low, shape)[1]
+    assert covered.all(), f"{(~covered).sum()} of {covered.size} hallway cells have no floor"
+
+
+def _read_stl(data: bytes) -> NDArray[np.float32]:
+    """A binary STL's triangles' corners."""
+    count = int.from_bytes(data[80:84], "little")
+    records = np.frombuffer(data[84 : 84 + 50 * count], np.dtype([("f", "<f4", 12), ("a", "<u2")]))
+    return records["f"][:, 3:].reshape(-1, 3, 3)
 
 
 def test_the_ranch_bottom_bedrooms_are_reachable_from_the_start(

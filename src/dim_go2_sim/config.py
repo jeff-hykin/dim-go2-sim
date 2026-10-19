@@ -32,10 +32,10 @@ class SceneConfig(BaseModel):
     scan: Path | None = None
     # Metres per unit of the scan; None is the scale measured for a known SuperSplat scene, else 1.
     scan_scale: float | None = Field(default=None, gt=0.0)
-    # A scan's cleared regions: a JSON file {"note": ..., "boxes": [[xmin, ymin, zmin, xmax, ymax,
-    # zmax], ...]} of world-frame boxes (metres) emptied of collision voxels; None is the regions
-    # shipped for a known SuperSplat scene, else none.
-    cleared: Path | None = None
+    # A scan's edits: a JSON file {"edits": [{"note": ..., "cleared": [[xmin, ymin, zmin, xmax,
+    # ymax, zmax], ...], "added": [...]}, ...]} of world-frame boxes (metres) emptied of, or
+    # filled with, collision voxels; None is the edits shipped for a known SuperSplat scene.
+    edits: Path | None = None
     mjcf: Path | None = None  # collision geometry; a robot-free MJCF
     # What the camera draws: a textured glTF/GLB, or Gaussian splats (.nurec, or a 3DGS .ply);
     # None draws nothing.
