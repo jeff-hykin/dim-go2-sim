@@ -104,8 +104,8 @@ Go2Sim.blueprint(scene={"package": "supersplat/3f89bbd3"}, people={"count": 2, "
 People walk slow loops through the scene: 1.69 m tall, 0.47 m across, made of a few capsules and
 a box. Each is a kinematic (mocap) body the robot bumps into and is pushed by, and they pass
 through each other and the scene; a person waits while the robot is within
-`people.yield_distance` ahead of them, and after `people.patience_s` turns back and walks their loop
-the other way. The camera draws them (among a splat scene's splats, so
+`people.yield_distance` ahead of them or right beside them, and after `people.patience_s` turns back
+and walks their loop the other way. The camera draws them (among a splat scene's splats, so
 walls hide them, or as meshes in a glTF scene), the lidar casts them, `contacts` reports touching
 one as `person`, `people` and tf give their poses (`person_<i>`), and `urdf_info` carries them.
 

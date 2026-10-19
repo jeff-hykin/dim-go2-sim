@@ -47,6 +47,9 @@ SHIRTS = ((0.75, 0.20, 0.18), (0.20, 0.45, 0.70), (0.30, 0.60, 0.30), (0.85, 0.6
 # The robot is in a person's way within this far either side of their path: half its length (it
 # may stand side-on) plus half a person's width.
 IN_THE_WAY = 0.6
+# Nor do they walk on with the robot this close beside them, unless it is behind them: half its
+# length plus half their width, and a margin.
+BESIDE = 0.7
 TURN_RATE = 2.5  # rad/s: a person turns toward their path no faster
 # Route planning: grid step, a person's clearance from anything, and the heights checked.
 PLAN_STEP = 0.1
@@ -235,7 +238,9 @@ class People:
             offset = robot_xy[:2] - point
             along = float(offset @ ahead)
             across = abs(float(offset[0] * ahead[1] - offset[1] * ahead[0]))
-            self.waiting[i] = 0 < along < self.config.yield_distance and across < IN_THE_WAY
+            ahead_of_them = 0 < along < self.config.yield_distance and across < IN_THE_WAY
+            beside_them = along > -0.2 and math.hypot(along, across) < BESIDE
+            self.waiting[i] = ahead_of_them or beside_them
             self._waited[i] = self._waited[i] + dt if self.waiting[i] else 0.0
             if self._waited[i] >= self.config.patience_s:
                 self._direction[i], self._waited[i] = -self._direction[i], 0.0

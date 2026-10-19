@@ -79,6 +79,10 @@ def test_a_person_waits_while_the_robot_is_in_their_way_then_turns_back() -> Non
         people.step(0.02, np.array([x + 0.8, 0.55]))
     x, _, yaw = people.poses()[0]
     assert x == pytest.approx(2.0 - 0.4 * 3.0, abs=0.05) and abs(yaw) > 3.0  # walking away
+    people.step(0.02, np.array([x, 0.6]))  # right beside them: they don't brush past it
+    assert people.waiting == [True]
+    people.step(0.02, np.array([x + 0.5, 0.3]))  # just behind them now: on they go
+    assert people.waiting == [False]
 
 
 def test_planned_loops_keep_clear_of_the_walls_and_the_cube(

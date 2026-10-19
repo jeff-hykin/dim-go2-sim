@@ -111,8 +111,8 @@ class PeopleConfig(BaseModel):
     # Each person's loop, as (x, y) waypoints walked in straight lines; None picks loops through
     # the open floor reachable from the robot's start.
     routes: list[list[tuple[float, float]]] | None = None
-    # A person waits while the robot's body is this close, metres, in the way ahead of them, and
-    # after patience_s turns back and walks their loop the other way.
+    # A person waits while the robot's body is this close, metres, in the way ahead of them (or
+    # right beside them), and after patience_s turns back and walks their loop the other way.
     yield_distance: float = 1.0
     patience_s: float = Field(default=3.0, gt=0.0)
 
