@@ -44,9 +44,9 @@ BODY = "person_{}"
 Material = Literal["skin", "shirt", "pants"]
 SKIN, PANTS = (0.80, 0.62, 0.50), (0.20, 0.24, 0.32)
 SHIRTS = ((0.75, 0.20, 0.18), (0.20, 0.45, 0.70), (0.30, 0.60, 0.30), (0.85, 0.65, 0.20))
-# Half the robot's width plus half a person's depth: the robot is in a person's way within this
-# far either side of their path.
-IN_THE_WAY = 0.45
+# The robot is in a person's way within this far either side of their path: half its length (it
+# may stand side-on) plus half a person's width.
+IN_THE_WAY = 0.6
 TURN_RATE = 2.5  # rad/s: a person turns toward their path no faster
 # Route planning: grid step, a person's clearance from anything, and the heights checked.
 PLAN_STEP = 0.1

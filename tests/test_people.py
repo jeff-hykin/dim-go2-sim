@@ -69,8 +69,8 @@ def test_a_person_walks_their_loop_and_waits_while_the_robot_is_in_the_way() -> 
         people.step(0.02, far)
     x, y, yaw = people.poses()[0]
     assert (x, y) == pytest.approx((2.0, 0.0), abs=0.01) and yaw == pytest.approx(0.0)
-    for _ in range(500):  # 10 s with the robot just ahead of them
-        people.step(0.02, np.array([x + 0.8, 0.1]))
+    for _ in range(500):  # 10 s with the robot just ahead of them, side-on, its nose in the way
+        people.step(0.02, np.array([x + 0.8, 0.55]))
     assert people.poses()[0][0] == pytest.approx(x) and people.waiting == [True]
     for _ in range(350):  # past the end of the leg, and turned back
         people.step(0.02, far)
