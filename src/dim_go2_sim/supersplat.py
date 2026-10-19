@@ -61,7 +61,7 @@ from dim_go2_sim.splat import Splats, load_splats, save_ply
 PREFIX = "supersplat/"
 VIEWER_URL = "https://superspl.at/s?id={id}"
 # Bump when cooking changes, so cooked scenes are rebuilt.
-COOK_VERSION = 3
+COOK_VERSION = 4
 # A streamed SuperSplat scene keeps levels of detail, each half the last; this one (from the
 # finest, 0) is drawn and collided with. The ranch home's is 2.7M splats, 31 MB.
 LOD_LEVEL = 3
@@ -254,6 +254,7 @@ def cook(
     occupied, origin = voxelize(world)
     clear(occupied, origin, edits.cleared)
     clear(occupied, origin, edits.added, solid=True)
+    drop_floaters(occupied)
     boxes = merged_boxes(occupied[:, :, : math.ceil(COLLISION_HEIGHT / VOXEL)])
     (folder / "scene.xml").write_text(mjcf(boxes, origin, 0.0, name))
     has_floor = floor_cells(world, occupied.shape[:2], origin)
@@ -414,6 +415,16 @@ def clear(
         last = last.astype(int)
         if (last >= first).all():
             occupied[first[0] : last[0] + 1, first[1] : last[1] + 1, first[2] : last[2] + 1] = solid
+
+
+def drop_floaters(occupied: NDArray[np.bool_]) -> None:
+    """Empties, in place, every solid patch smaller than MIN_PATCH voxels: the specks an edit leaves
+    where it cuts through scan noise."""
+    from scipy import ndimage
+
+    labels, n = ndimage.label(occupied, np.ones((3, 3, 3)))
+    sizes = np.bincount(labels.ravel(), minlength=n + 1)
+    occupied[(sizes < MIN_PATCH)[labels] & occupied] = False
 
 
 def floor_cells(

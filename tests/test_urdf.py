@@ -140,7 +140,9 @@ def test_urdf_names_each_mesh_by_its_hash_and_poses_the_legs_by_tf(shared) -> No
 def test_the_scene_and_the_people_are_each_a_group_the_robot_in_none(tmp_path: Path) -> None:
     vertices, faces = room()
     scene = SceneSource("room", "1", lambda: (vertices, faces))
-    xml = share_urdf(go2_spec(False).compile(), "go2/", scene, UrdfConfig(tile_faces=8), tmp_path, people=2).xml
+    xml = share_urdf(
+        go2_spec(False).compile(), "go2/", scene, UrdfConfig(tile_faces=8), tmp_path, people=2
+    ).xml
     groups = {link.get("name"): link.findtext("group") for link in ET.fromstring(xml).iter("link")}
     assert {name: group for name, group in groups.items() if group} == {
         "go2/scene_mesh": "scene",

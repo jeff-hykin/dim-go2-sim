@@ -43,6 +43,39 @@ DOG_CLEARANCE = 0.17
 # (x), and its ends (y), as the scan has them.
 HALLWAY_WALLS = (2.33, 3.28)
 HALLWAY_ENDS = (-3.58, -6.88)
+# A point on open floor in each of the ranch's rooms (its edits rebuild them room by room).
+RANCH_ROOMS = {
+    "living room": (4.5, 3.5),
+    "entry": (5.0, -3.2),
+    "dining room": (1.2, -2.0),
+    "kitchen": (0.3, 3.0),
+    "family room": (-5.0, 1.0),
+    "hall bathroom": (1.6, -4.1),
+    "hallway": (2.8, -5.5),
+    "cross hall": (3.0, -7.3),
+    "office": (5.5, -6.5),
+    "south-west bedroom": (0.0, -9.0),
+    "south-east bedroom": (4.5, -9.0),
+    "north hall": (-2.55, 5.0),
+    "main bathroom": (-5.0, 4.5),
+    "north bedroom": (-5.0, 8.8),
+}
+# The plants an eval grades, each at (x, y, the height of its leaves), and how near the robot must
+# get to one, seeing it.
+RANCH_PLANTS = {
+    "palm on the bedroom floor": (-6.6, 8.1, 0.9),
+    "kitchen shelf plants": (-1.75, 3.2, 1.65),
+    "sideboard plant": (-0.35, -3.35, 1.05),
+    "stove-ledge plant": (5.45, -2.4, 1.4),
+    "entry-table plant": (4.27, -3.8, 0.95),
+}
+PLANT_REACH = 1.2
+# The ranch's beds' footprints: solid to the floor, so the robot can't get under one or into it.
+RANCH_BEDS = {
+    "north": (-6.25, 9.35, -4.35, 11.8),
+    "south-west": (-1.0, -11.65, 0.65, -9.35),
+    "south-east": (4.4, -11.55, 6.0, -9.3),
+}
 
 
 def splats(positions: np.ndarray, normals: np.ndarray, sigma: float = 0.02) -> Splats:
@@ -323,8 +356,11 @@ def test_the_ranch_cleared_regions_are_open(ranch: supersplat.ScanScene) -> None
     regions, added = np.array(edits.cleared), np.array(edits.added)
     assert len(regions) > 0 and len(added) > 0
     centres = (regions[:, :3] + regions[:, 3:]) / 2
-    # A region an added solid walls over again is solid.
-    walled = (centres[:, None] > added[None, :, :3]) & (centres[:, None] < added[None, :, 3:])
+    # A region an added solid walls over again (to within the half voxel it takes) is solid.
+    v = supersplat.VOXEL / 2
+    walled = (centres[:, None] > added[None, :, :3] - v) & (
+        centres[:, None] < added[None, :, 3:] + v
+    )
     centres = centres[~walled.all(axis=2).any(axis=1)]
     boxes = _ranch_boxes(ranch)
     inside = (np.abs(centres[:, None, :] - boxes[None, :, :3]) < boxes[None, :, 3:]).all(axis=2)
@@ -422,6 +458,112 @@ def test_the_ranch_bottom_bedrooms_are_reachable_from_the_start(
     for name, (x, y) in BOTTOM_BEDROOMS.items():
         cell = tuple(np.floor((np.array([x, y]) - low) / v).astype(int))
         assert labels[cell] == start, f"the {name} bedroom isn't reachable from the start"
+
+
+def _reachable(ranch: supersplat.ScanScene) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+    """The ranch's grid corner, and the columns the robot's centre can reach from the start: open
+    floor DOG_CLEARANCE from anything in its way, connected to the first spawn."""
+    from scipy import ndimage
+
+    v = supersplat.VOXEL
+    low, has_floor, blocked = _ranch_grid(ranch)
+    room = ndimage.distance_transform_edt(has_floor & ~blocked) * v >= DOG_CLEARANCE
+    labels, _ = ndimage.label(room)
+    start = labels[tuple(np.floor((np.array(ranch.spawns[0][:2]) - low) / v).astype(int))]
+    assert start > 0, "the start isn't on open floor"
+    return low, labels == start
+
+
+def _ranch_raycaster(ranch: supersplat.ScanScene):
+    import open3d as o3d
+
+    mesh = np.load(ranch.collision)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.core.Tensor(mesh["vertices"]), o3d.core.Tensor(mesh["faces"]))
+    return scene
+
+
+def test_every_ranch_room_and_spawn_is_reachable_from_the_start(
+    ranch: supersplat.ScanScene,
+) -> None:
+    v = supersplat.VOXEL
+    low, reachable = _reachable(ranch)
+    points = {**RANCH_ROOMS, **{f"spawn {i}": s[:2] for i, s in enumerate(ranch.spawns)}}
+    for name, (x, y) in points.items():
+        cell = tuple(np.floor((np.array([x, y]) - low) / v).astype(int))
+        assert reachable[cell], f"the {name} isn't reachable from the start"
+
+
+def test_the_robot_can_get_near_each_ranch_plant_and_see_it(ranch: supersplat.ScanScene) -> None:
+    import open3d as o3d
+
+    v = supersplat.VOXEL
+    low, reachable = _reachable(ranch)
+    scene = _ranch_raycaster(ranch)
+    cells = low + (np.argwhere(reachable) + 0.5) * v
+    for name, (x, y, height) in RANCH_PLANTS.items():
+        near = cells[np.hypot(cells[:, 0] - x, cells[:, 1] - y) < PLANT_REACH]
+        assert len(near), f"the robot can't get within {PLANT_REACH} m of the {name}"
+        # From each, a ray at the plant's height towards it hits nothing before the plant itself.
+        starts = np.column_stack([near, np.full(len(near), height)])
+        ahead = np.array([x, y, height]) - starts
+        distance = np.linalg.norm(ahead, axis=1)
+        rays = np.column_stack([starts, ahead / distance[:, None]]).astype(np.float32)
+        hits = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+        seen = hits > distance - 0.3
+        assert seen.any(), f"the {name} is hidden from everywhere the robot can get near it"
+
+
+def test_a_ranch_bed_blocks_a_low_ray_from_every_side(ranch: supersplat.ScanScene) -> None:
+    import open3d as o3d
+
+    scene = _ranch_raycaster(ranch)
+    height = 0.2  # under a bed frame's rail, where the scan saw nothing
+    for name, (x0, y0, x1, y1) in RANCH_BEDS.items():
+        rays = []
+        # Rays from 0.4 m off each side, square towards the bed, every 10 cm along it (a side that
+        # stands against a wall is reached from inside the wall, which the ray leaves at once).
+        for along in np.arange(0.1, 1.0, 0.1):
+            x, y = x0 + along * (x1 - x0), y0 + along * (y1 - y0)
+            for start, direction in (
+                ((x0 - 0.4, y), (1, 0)),
+                ((x1 + 0.4, y), (-1, 0)),
+                ((x, y0 - 0.4), (0, 1)),
+                ((x, y1 + 0.4), (0, -1)),
+            ):
+                rays.append([*start, height, *direction, 0])
+        hits = scene.cast_rays(o3d.core.Tensor(np.array(rays, np.float32)))["t_hit"].numpy()
+        gaps = hits > 0.4 + supersplat.VOXEL
+        assert not gaps.any(), (
+            f"the {name} bed lets a ray under it at {np.array(rays)[gaps][:3, :2]}"
+        )
+
+
+def test_nothing_floats_in_the_ranch(ranch: supersplat.ScanScene) -> None:
+    from scipy import ndimage
+
+    v = supersplat.VOXEL
+    boxes = _ranch_boxes(ranch)
+    low = (boxes[:, :3] - boxes[:, 3:]).min(axis=0)
+    first = np.round((boxes[:, :3] - boxes[:, 3:] - low) / v).astype(int)
+    last = np.round((boxes[:, :3] + boxes[:, 3:] - low) / v).astype(int)
+    solid = np.zeros(last.max(axis=0), bool)
+    for a, b in zip(first, last, strict=True):
+        solid[a[0] : b[0], a[1] : b[1], a[2] : b[2]] = True
+    labels, _ = ndimage.label(solid, np.ones((3, 3, 3)))
+    # Every patch stands on the floor or reaches up past the boxes (a wall, a hanging lamp).
+    held = set(np.unique(labels[:, :, 0])) | set(np.unique(labels[:, :, -1]))
+    floating = sorted(set(np.unique(labels)) - held)
+    sizes = [int((labels == k).sum()) for k in floating]
+    assert not floating, f"{len(floating)} patches float in the air, {sizes} voxels"
+
+
+def test_a_speck_an_edit_leaves_is_dropped() -> None:
+    occupied = np.zeros((20, 20, 20), bool)
+    occupied[2:12, 2:12, 0:10] = True  # a 1000-voxel block
+    occupied[15:17, 15:17, 5:7] = True  # an 8-voxel speck
+    supersplat.drop_floaters(occupied)
+    assert occupied.sum() == 1000 and not occupied[15:17, 15:17, 5:7].any()
 
 
 @pytest.fixture(scope="module")

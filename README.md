@@ -86,11 +86,16 @@ arbitrary frame and scale, so the first run cooks it (a few seconds):
 - **Edits.** Where a scan's noise or a piece of furniture's underside blocks floor the robot
   should cross, or a wall came out ragged, a scene can list world-frame boxes whose voxels are
   emptied (cleared) or filled (added, after the clearing) before the boxes, lidar surfaces, spawns
-  and shared collision meshes are built (the splats are drawn as they are). The ranch home ships
-  its own (`data/supersplat/3f89bbd3_edits.json`, marked by hand: noise and furniture undersides
-  cleared, and its hallway down to the bottom bedrooms cleared and given straight walls);
-  `scene.edits` points at another file: `{"edits": [{"note": ..., "cleared": [[xmin, ymin, zmin,
-  xmax, ymax, zmax], ...], "added": [...]}, ...]}`, in metres.
+  and shared collision meshes are built (the splats are drawn as they are); specks under 30
+  voxels an edit leaves are dropped. The ranch home ships its own
+  (`data/supersplat/3f89bbd3_edits.json`): rebuilt room by room, each room's scan voxels up to 2 m
+  cleared and replaced by straight 10 cm wall slabs (doorways open, doors drawn open or shut as
+  the scan has them, closets and rooms the scan never saw into shut) and a box or a few for each
+  piece of furniture (beds solid to the floor, so the robot can't get under or into one; tables
+  solid unless the robot could really walk under them), the graded plants kept as scanned, and the
+  junk outside its exterior walls cleared. `scene.edits` points at another file: `{"edits":
+  [{"note": ..., "cleared": [[xmin, ymin, zmin, xmax, ymax, zmax], ...], "added": [...]}, ...]}`,
+  in metres.
 
 Only a scan's degree-0 (view-independent) colour is kept: higher spherical harmonics would have
 to be turned with it. Splats from a 3DGS PLY are drawn as the InteriorGS ones are, evaluated in 3D.
