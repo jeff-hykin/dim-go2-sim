@@ -23,13 +23,18 @@ cooking it:
   voxelised at VOXEL, specks of a few voxels dropped as floaters, walls filled down to the floor
   (their feet are often thin in a scan), and the voxels from just above
   the floor to COLLISION_HEIGHT merged into boxes for MuJoCo, over a floor plane; the lidar casts
-  against the voxels' outer faces, at every height, and the floor under the scan.
+  against the voxels' outer faces, at every height, and the floor under the scan;
+- clears the scene's cleared regions (boxes marked by hand where the scan's noise or furniture
+  undersides block open floor) of voxels before any of that is built from them; the splats are
+  drawn as they are.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import hashlib
+from importlib.resources import files
 import json
 import math
 import os
@@ -53,7 +58,7 @@ from dim_go2_sim.splat import Splats, load_splats, save_ply
 PREFIX = "supersplat/"
 VIEWER_URL = "https://superspl.at/s?id={id}"
 # Bump when cooking changes, so cooked scenes are rebuilt.
-COOK_VERSION = 1
+COOK_VERSION = 2
 # A streamed SuperSplat scene keeps levels of detail, each half the last; this one (from the
 # finest, 0) is drawn and collided with. The ranch home's is 2.7M splats, 31 MB.
 LOD_LEVEL = 3
@@ -79,6 +84,9 @@ WALL_SPAN = 0.6  # metres
 FLOOR_CLEARANCE = 0.06
 
 
+Region = tuple[float, float, float, float, float, float]  # xmin, ymin, zmin, xmax, ymax, zmax
+
+
 @dataclass(frozen=True)
 class ScanScene:
     mjcf: Path
@@ -100,33 +108,65 @@ def _cache(cache_dir: Path | None) -> Path:
     )
 
 
-def load_scene(scene: str, cache_dir: Path | None = None, scale: float | None = None) -> ScanScene:
-    """SuperSplat scene *scene*, downloaded (~30 MB) and cooked the first time."""
+def load_scene(
+    scene: str,
+    cache_dir: Path | None = None,
+    scale: float | None = None,
+    cleared: Path | None = None,
+) -> ScanScene:
+    """SuperSplat scene *scene*, downloaded (~30 MB) and cooked the first time; its voxels in the
+    regions listed in *cleared* (a JSON file, see cleared_regions) are cleared, by default those
+    shipped for the scene."""
     folder = _cache(cache_dir) / "supersplat" / scene
     scale = scale or SCALES.get(scene, 1.0)
+    regions = cleared_regions(cleared) if cleared is not None else bundled_cleared_regions(scene)
 
     def splats() -> Splats:
         meta = _download_sog(scene, folder / "sog")
         return _concatenated([load_splats(m) for m in meta])
 
-    return _cooked(folder, f"supersplat-{scene}", scale, splats)
+    return _cooked(folder, f"supersplat-{scene}", scale, splats, regions)
 
 
-def load_scan(path: Path, cache_dir: Path | None = None, scale: float = 1.0) -> ScanScene:
-    """A local scan (a 3DGS PLY or SOG meta.json), cooked the first time."""
+def load_scan(
+    path: Path, cache_dir: Path | None = None, scale: float = 1.0, cleared: Path | None = None
+) -> ScanScene:
+    """A local scan (a 3DGS PLY or SOG meta.json), cooked the first time, its voxels in the
+    regions listed in *cleared* cleared."""
     path = Path(path).resolve()
     stat = path.stat()
     key = hashlib.sha256(f"{path} {stat.st_size} {stat.st_mtime_ns}".encode()).hexdigest()[:12]
     folder = _cache(cache_dir) / "scans" / f"{path.stem}-{key}"
-    return _cooked(folder, path.stem, scale, lambda: load_splats(path))
+    regions = cleared_regions(cleared) if cleared is not None else []
+    return _cooked(folder, path.stem, scale, lambda: load_splats(path), regions)
 
 
-def _cooked(folder: Path, name: str, scale: float, splats: object) -> ScanScene:
+def cleared_regions(path: Path) -> list[Region]:
+    """The world-frame boxes in a cleared-regions file: JSON {"note": where they came from,
+    "boxes": [[xmin, ymin, zmin, xmax, ymax, zmax], ...]}, in metres."""
+    return [tuple(map(float, b)) for b in json.loads(Path(path).read_text())["boxes"]]  # type: ignore[misc]
+
+
+def bundled_cleared_regions(scene: str) -> list[Region]:
+    """The cleared regions shipped for SuperSplat scene *scene*, if any."""
+    bundled = files("dim_go2_sim") / f"data/supersplat/{scene}_cleared.json"
+    return cleared_regions(Path(str(bundled))) if bundled.is_file() else []
+
+
+def _cooked(
+    folder: Path, name: str, scale: float, splats: object, cleared: list[Region]
+) -> ScanScene:
     info_path = folder / "scene.json"
     info = json.loads(info_path.read_text()) if info_path.is_file() else {}
-    if info.get("cook_version") != COOK_VERSION or info.get("scale") != scale:
+    cleared_key = hashlib.sha256(json.dumps(cleared).encode()).hexdigest()[:16]
+    if (
+        info.get("cook_version") != COOK_VERSION
+        or info.get("scale") != scale
+        or info.get("cleared") != cleared_key
+    ):
         folder.mkdir(parents=True, exist_ok=True)
-        info = cook(splats(), folder, name, scale)  # type: ignore[operator]
+        info = cook(splats(), folder, name, scale, cleared)  # type: ignore[operator]
+        info["cleared"] = cleared_key
         info_path.write_text(json.dumps(info))
     return ScanScene(
         mjcf=folder / "scene.xml",
@@ -183,12 +223,16 @@ def _concatenated(parts: list[Splats]) -> Splats:
     )
 
 
-def cook(splats: Splats, folder: Path, name: str, scale: float) -> dict[str, object]:
-    """Levels, scales and voxelises *splats*; writes the scene's files into *folder*."""
+def cook(
+    splats: Splats, folder: Path, name: str, scale: float, cleared: Sequence[Region] = ()
+) -> dict[str, object]:
+    """Levels, scales and voxelises *splats*, clearing the *cleared* regions of voxels; writes the
+    scene's files into *folder*."""
     rotation, floor = levelling(splats)
     world = transformed(splats, rotation, floor, scale)
     save_ply(world, folder / "splats.ply")
     occupied, origin = voxelize(world)
+    clear(occupied, origin, cleared)
     boxes = merged_boxes(occupied[:, :, : math.ceil(COLLISION_HEIGHT / VOXEL)])
     (folder / "scene.xml").write_text(mjcf(boxes, origin, 0.0, name))
     has_floor = floor_cells(world, occupied.shape[:2], origin)
@@ -328,6 +372,23 @@ def voxelize(splats: Splats) -> tuple[NDArray[np.bool_], NDArray[np.float64]]:
     band = solid[:, :, max(0, top - round(1.0 / VOXEL)) : top]
     solid[band.sum(axis=2) * VOXEL >= WALL_SPAN, :top] = True
     return solid, origin
+
+
+def clear(
+    occupied: NDArray[np.bool_], origin: NDArray[np.float64], regions: Sequence[Region]
+) -> None:
+    """Empties, in place, every voxel whose centre is inside one of *regions*, padded by just under
+    half a voxel: a region drawn on voxel faces (to the mm) takes the voxels it bounds, no more."""
+    pad = 0.4 * VOXEL
+    for region in regions:
+        low = np.array(region[:3]) - pad
+        high = np.array(region[3:]) + pad
+        # Voxel i's centre is origin + (i + 0.5) * VOXEL: the first and last inside low..high.
+        first = np.maximum(np.ceil((low - origin) / VOXEL - 0.5), 0).astype(int)
+        last = np.minimum(np.floor((high - origin) / VOXEL - 0.5), np.array(occupied.shape) - 1)
+        last = last.astype(int)
+        if (last >= first).all():
+            occupied[first[0] : last[0] + 1, first[1] : last[1] + 1, first[2] : last[2] + 1] = False
 
 
 def floor_cells(

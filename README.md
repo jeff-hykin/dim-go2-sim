@@ -81,6 +81,12 @@ arbitrary frame and scale, so the first run cooks it (a few seconds):
   down to the floor (walls' feet are thin in a scan). As with InteriorGS, the voxels up to 2 m are
   merged into boxes for MuJoCo over a floor plane, and the lidar casts against the voxels' faces
   and the floor under the scan. Spawns are picked on open floor.
+- **Cleared regions.** Where a scan's noise or a piece of furniture's underside blocks floor the
+  robot should cross, a scene can list world-frame boxes whose voxels are emptied before the
+  boxes, lidar surfaces, spawns and shared collision meshes are built (the splats are drawn as
+  they are). The ranch home ships its own (`data/supersplat/3f89bbd3_cleared.json`, marked by
+  hand); `scene.cleared` points at another file: `{"note": ..., "boxes": [[xmin, ymin, zmin,
+  xmax, ymax, zmax], ...]}`, in metres.
 
 Only a scan's degree-0 (view-independent) colour is kept: higher spherical harmonics would have
 to be turned with it. Splats from a 3DGS PLY are drawn as the InteriorGS ones are, evaluated in 3D.
@@ -135,7 +141,7 @@ SPZ file (`scenes/interiorgs_<id>/splats.spz`, world frame, Z up). The files are
 
 `Go2SimConfig` has a section per part, each overridable from a blueprint or the dimOS CLI:
 
-- `scene`: `package`, `scan`, `scan_scale`, `mjcf`, `visual`, `visual_y_up`, `start` (x, y, yaw;
+- `scene`: `package`, `scan`, `scan_scale`, `cleared`, `mjcf`, `visual`, `visual_y_up`, `start` (x, y, yaw;
   default the scene's first spawn), `floor_z`, `floor_top_z`
 - `physics`: `timestep`, `fitted`, `actuator_tau`, `policy`, `track_velocity`,
   `command_timeout`, `max_velocity`, `realtime`, `cache_dir`

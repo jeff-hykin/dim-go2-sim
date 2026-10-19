@@ -16,8 +16,10 @@ import json
 import math
 import os
 from pathlib import Path
+from xml.etree import ElementTree
 
 import numpy as np
+from numpy.typing import NDArray
 from PIL import Image
 import pytest
 from scipy.spatial.transform import Rotation
@@ -26,12 +28,17 @@ from dim_go2_sim import supersplat
 from dim_go2_sim.camera import SceneCamera
 from dim_go2_sim.config import CameraConfig, PhysicsConfig, SceneConfig
 from dim_go2_sim.contacts import Contact, ContactSensor
+from dim_go2_sim.interiorgs import ROBOT_HEIGHT
 from dim_go2_sim.splat import Splats, load_ply, load_sog, save_ply
 from dim_go2_sim.world import Go2World, load_world
 
 # The NJ ranch home the real-data tests cook (~31 MB the first time): opt in with
 # DIM_GO2_SIM_DOWNLOAD=1, or have it cooked already.
 RANCH = "3f89bbd3"
+# The ranch's two bottom (south) bedrooms, a point on open floor in each, and how far the Go2's
+# centre keeps from anything in its way (half its width, and a little).
+BOTTOM_BEDROOMS = {"south-west": (0.0, -9.0), "south-east": (4.5, -9.0)}
+DOG_CLEARANCE = 0.17
 
 
 def splats(positions: np.ndarray, normals: np.ndarray, sigma: float = 0.02) -> Splats:
@@ -195,6 +202,85 @@ def test_the_room_collides_where_its_surfaces_are(tmp_path: Path) -> None:
     assert math.hypot(x, y) < 0.6, "not out in the open"
     mesh = np.load(tmp_path / "collision.npz")
     assert mesh["vertices"][:, 2].min() == pytest.approx(0.0), "no floor for the lidar"
+
+
+def test_a_cleared_region_empties_the_voxels_inside_it_and_no_others(tmp_path: Path) -> None:
+    occupied, origin = supersplat.voxelize(room_scan())
+    v = supersplat.VOXEL
+    before = occupied.copy()
+    # The cube's voxels, by their faces (as boxes merged from them give them), to the mm.
+    i = np.argwhere(occupied)
+    centres = origin + (i + 0.5) * v
+    cube = (centres[:, :2] > [4.9, 2.9]).all(axis=1) & (centres[:, 2] < 0.7)
+    cube &= (centres[:, :2] < [5.7, 3.7]).all(axis=1)
+    low = np.round(origin + i[cube].min(axis=0) * v, 3)
+    high = np.round(origin + (i[cube].max(axis=0) + 1) * v, 3)
+    supersplat.clear(occupied, origin, [(*low, *high)])
+    expected = before.copy()
+    expected[tuple(i[cube].T)] = False
+    assert cube.sum() > 100 and (occupied == expected).all()
+    # Cooked with the whole room cleared, only the floor is left to collide with.
+    supersplat.cook(room_scan(), tmp_path, "room", 1.0, [(-9, -9, -9, 9, 9, 9)])
+    assert np.load(tmp_path / "collision.npz")["vertices"][:, 2].max() == 0.0
+
+
+def _ranch_boxes(ranch: supersplat.ScanScene) -> NDArray[np.float64]:
+    """The cooked ranch's MuJoCo boxes: centre and half-size, x y z."""
+    return np.array(
+        [
+            [float(n) for n in g.get("pos").split() + g.get("size").split()]
+            for g in ElementTree.parse(ranch.mjcf).iter("geom")
+            if g.get("type") == "box"
+        ]
+    )
+
+
+def _ranch_grid(
+    ranch: supersplat.ScanScene,
+) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.bool_]]:
+    """The cooked ranch's grid corner, its floor columns and its columns blocked below the
+    robot's height, from its MuJoCo boxes and the lidar's floor quads."""
+    v = supersplat.VOXEL
+    boxes = _ranch_boxes(ranch)
+    mesh = np.load(ranch.collision)
+    triangles = mesh["vertices"][mesh["faces"]]
+    floor = triangles[(np.abs(triangles[:, :, 2]) < 1e-6).all(axis=1)].mean(axis=1)[:, :2]
+    low = np.minimum(floor.min(axis=0), (boxes[:, :2] - boxes[:, 3:5]).min(axis=0)) - 1
+    shape = tuple(np.ceil((floor.max(axis=0) - low) / v).astype(int) + 40)
+    has_floor = np.zeros(shape, bool)
+    has_floor[tuple(np.floor((floor - low) / v).astype(int).T)] = True
+    blocked = np.zeros(shape, bool)
+    for x, y, _, sx, sy, _ in boxes[boxes[:, 2] - boxes[:, 5] < ROBOT_HEIGHT]:
+        a = np.round((np.array([x - sx, y - sy]) - low) / v).astype(int)
+        b = np.round((np.array([x + sx, y + sy]) - low) / v).astype(int)
+        blocked[a[0] : b[0], a[1] : b[1]] = True
+    return low, has_floor, blocked
+
+
+def test_the_ranch_cleared_regions_are_open(ranch: supersplat.ScanScene) -> None:
+    regions = np.array(supersplat.bundled_cleared_regions(RANCH))
+    assert len(regions) > 0
+    centres = (regions[:, :3] + regions[:, 3:]) / 2
+    boxes = _ranch_boxes(ranch)
+    inside = (np.abs(centres[:, None, :] - boxes[None, :, :3]) < boxes[None, :, 3:]).all(axis=2)
+    assert not inside.any(), f"{inside.any(axis=1).sum()} cleared regions still collide"
+
+
+def test_the_ranch_bottom_bedrooms_are_reachable_from_the_start(
+    ranch: supersplat.ScanScene,
+) -> None:
+    from scipy import ndimage
+
+    v = supersplat.VOXEL
+    low, has_floor, blocked = _ranch_grid(ranch)
+    # Where the robot's centre can be: open floor DOG_CLEARANCE from anything in its way.
+    room = ndimage.distance_transform_edt(has_floor & ~blocked) * v >= DOG_CLEARANCE
+    labels, _ = ndimage.label(room)
+    start = labels[tuple(np.floor((np.array(ranch.spawns[0][:2]) - low) / v).astype(int))]
+    assert start > 0
+    for name, (x, y) in BOTTOM_BEDROOMS.items():
+        cell = tuple(np.floor((np.array([x, y]) - low) / v).astype(int))
+        assert labels[cell] == start, f"the {name} bedroom isn't reachable from the start"
 
 
 @pytest.fixture(scope="module")
