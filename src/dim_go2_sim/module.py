@@ -26,6 +26,8 @@ from typing import Any
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
+from dimos.msgs.geometry_msgs.Pose import Pose
+from dimos.msgs.geometry_msgs.PoseArray import PoseArray
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Quaternion import Quaternion
 from dimos.msgs.geometry_msgs.Transform import Transform
@@ -35,6 +37,7 @@ from dimos.msgs.sensor_msgs.CameraInfo import CameraInfo
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.Imu import Imu
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
+from dimos.msgs.std_msgs.Header import Header
 from dimos.msgs.tf2_msgs.TFMessage import TFMessage
 from dimos.utils.logging_config import setup_logger
 from dimos_lcm.std_msgs import String
@@ -46,7 +49,14 @@ from reactivex.disposable import Disposable
 from scipy.spatial.transform import Rotation
 
 from dim_go2_sim import interiorgs, supersplat
-from dim_go2_sim.config import CameraConfig, LidarConfig, PhysicsConfig, SceneConfig, UrdfConfig
+from dim_go2_sim.config import (
+    CameraConfig,
+    LidarConfig,
+    PeopleConfig,
+    PhysicsConfig,
+    SceneConfig,
+    UrdfConfig,
+)
 from dim_go2_sim.contacts import Contacts, ContactSensor
 from dim_go2_sim.lidar import (
     LidarScan,
@@ -56,6 +66,7 @@ from dim_go2_sim.lidar import (
     static_geoms,
     static_triangles,
 )
+from dim_go2_sim.people import BODY, People, plan_routes
 from dim_go2_sim.splat import is_splats
 from dim_go2_sim.urdf import (
     MeshFile,
@@ -81,15 +92,17 @@ class Go2SimConfig(ModuleConfig):
     lidar: LidarConfig = Field(default_factory=LidarConfig)
     camera: CameraConfig = Field(default_factory=CameraConfig)
     urdf: UrdfConfig = Field(default_factory=UrdfConfig)
+    people: PeopleConfig = Field(default_factory=PeopleConfig)
     odom_hz: float = 50.0
     imu_hz: float = 50.0
     frame_prefix: str = ""  # namespaces every frame published, e.g. "go2/"
 
 
 class Go2Sim(Module):
-    """cmd_vel in; the Go2's lidar, camera, IMU, odometry, tf, and contacts out.
+    """cmd_vel in; the Go2's lidar, camera, IMU, odometry, tf, and contacts out, and where any
+    people walking about are.
 
-    Odometry is the true body pose; contacts are ground truth, for grading.
+    Odometry is the true body pose; contacts and people are ground truth, for grading.
     """
 
     config: Go2SimConfig
@@ -103,6 +116,8 @@ class Go2Sim(Module):
     odom: Out[PoseStamped]
     tf: Out[TFMessage]
     contacts: Out[Contacts]
+    # Each person's pose in world (on the floor, facing their heading), with odom.
+    people: Out[PoseArray]
     # The robot and scene as a URDF, its meshes named package://dim_go2_sim/<path>?hash=<sha256>;
     # any of those names on mesh_request gets the file on mesh_info, unless it has &have=<sha256>;
     # an empty mesh_request gets urdf_info now, for a viewer that just connected.
@@ -118,6 +133,7 @@ class Go2Sim(Module):
         self._command = np.zeros(3)
         self._command_time = -math.inf
         self._pose: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None
+        self._people_poses = np.zeros((0, 3))
         self._clock_origin = 0.0
         self._shared_urdf: SharedUrdf | None = None
         self._mesh_requests: list[str] = []
@@ -129,12 +145,33 @@ class Go2Sim(Module):
         super().start()
         cfg = self.config
         scene = resolve_scene(cfg.scene, cfg.physics.cache_dir)
-        self.world = Go2World(load_world(scene.mjcf, cfg.physics), cfg.physics)
+        people = cfg.people.count
+        self.world = Go2World(load_world(scene.mjcf, cfg.physics, people), cfg.physics)
         floor_z = scene.floor_z if cfg.scene.floor_z is None else cfg.scene.floor_z
         x, y, yaw = cfg.scene.start or (scene.spawns[0] if scene.spawns else (0.0, 0.0, 0.0))
         self.world.reset(x, y, yaw, floor_z)
         model, data = self.world.model, self.world.data
         robot_bodies = {b for b in range(model.nbody) if self.world.is_robot(b)}
+        raycaster = Raycaster(
+            model,
+            data,
+            robot_bodies,
+            compose(None, cfg.physics, ground=False, people=people)
+            if cfg.lidar.self_occlusion or people
+            else None,
+            int(model.jnt_qposadr[model.body_jntadr[self.world.trunk]]),
+            scene.lidar_mesh,
+            robot_visible=cfg.lidar.self_occlusion,
+        )
+        if people:
+            routes = cfg.people.routes or plan_routes(
+                raycaster.cast_static, raycaster.bounds, (x, y), people, cfg.people.seed
+            )
+            loops = [[(round(px, 2), round(py, 2)) for px, py in route] for route in routes]
+            logger.info(f"people walk these loops: {loops}")
+            self.world.people = People(routes, cfg.people, (x, y))
+            self.world.reset(x, y, yaw, floor_z)
+            self._people_poses = self.world.people.poses()
         floor_top_z = floor_z + 0.05 if cfg.scene.floor_top_z is None else cfg.scene.floor_top_z
         self.sensor = ContactSensor(
             model, data, robot_bodies, self.world.trunk, self.world.feet, floor_top_z
@@ -148,15 +185,6 @@ class Go2Sim(Module):
         }
         self._lidar: RollingLidar | None = None
         if cfg.lidar.enabled:
-            robot = compose(None, cfg.physics, ground=False) if cfg.lidar.self_occlusion else None
-            raycaster = Raycaster(
-                model,
-                data,
-                robot_bodies,
-                robot,
-                int(model.jnt_qposadr[model.body_jntadr[self.world.trunk]]),
-                scene.lidar_mesh,
-            )
             self._lidar_mount = mount_rotation(cfg.lidar.pitch_deg)
             self._lidar = RollingLidar(cfg.lidar, raycaster, self._lidar_pose)
         # Each leg link's tf edge from its parent's frame, published with the body pose.
@@ -224,7 +252,9 @@ class Go2Sim(Module):
             source = SceneSource(scene.name, scene.key, mesh, splats)
         started = time.monotonic()
         robot = go2_spec(False).compile()
-        shared = share_urdf(robot, cfg.frame_prefix, source, cfg.urdf, cfg.physics.cache_dir)
+        shared = share_urdf(
+            robot, cfg.frame_prefix, source, cfg.urdf, cfg.physics.cache_dir, cfg.people.count
+        )
         self._shared_urdf = shared
         logger.info(
             f"urdf_info: {len(shared.files)} mesh files, "
@@ -288,6 +318,8 @@ class Go2Sim(Module):
             stamp = self._clock_origin + world.time
             with self._lock:
                 self._pose = world.base_pose()
+                if world.people is not None:
+                    self._people_poses = world.people.poses()
             if world.time >= next_odom:
                 next_odom += 1.0 / cfg.odom_hz
                 self._publish_pose(stamp)
@@ -344,6 +376,26 @@ class Go2Sim(Module):
                     ts=stamp,
                 )
             )
+        for i, (px, py, pyaw) in enumerate(self._people_poses):
+            transforms.append(
+                Transform(
+                    translation=Vector3(px, py, 0.0),
+                    rotation=Quaternion(0.0, 0.0, math.sin(pyaw / 2), math.cos(pyaw / 2)),
+                    frame_id=f["world"],
+                    child_frame_id=self.config.frame_prefix + BODY.format(i),
+                    ts=stamp,
+                )
+            )
+        if len(self._people_poses):
+            self.people.publish(
+                PoseArray(
+                    Header(stamp, f["world"]),
+                    [
+                        Pose(px, py, 0.0, 0.0, 0.0, math.sin(pyaw / 2), math.cos(pyaw / 2))
+                        for px, py, pyaw in self._people_poses
+                    ],
+                )
+            )
         for body, parent, child, parent_frame in self._leg_edges:
             translation, rotation = body_in_parent(self.world.data, body, parent)
             qx, qy, qz, qw = Rotation.from_matrix(rotation).as_quat()
@@ -385,7 +437,7 @@ class Go2Sim(Module):
         from dim_go2_sim.camera import SceneCamera, focal_length
 
         cfg = self.config.camera
-        camera = SceneCamera(visual, y_up, cfg)
+        camera = SceneCamera(visual, y_up, cfg, self.config.people.count)
         mount = mount_rotation(cfg.pitch_deg)
         focal = focal_length(cfg)
         frame = self.frames["camera_optical"]
@@ -395,13 +447,15 @@ class Go2Sim(Module):
             while not self._stop.wait(max(0.0, next_frame - time.monotonic())):
                 next_frame = max(next_frame + period, time.monotonic())
                 with self._lock:
-                    pose = self._pose
+                    pose, people = self._pose, self._people_poses.copy()
                 if pose is None:
                     continue
                 position, rotation = pose
                 stamp = time.time()
                 eye = rotation @ mount
-                rgb = camera.capture(position + rotation @ np.array(cfg.xyz), eye[:, 0], eye[:, 2])
+                rgb = camera.capture(
+                    position + rotation @ np.array(cfg.xyz), eye[:, 0], eye[:, 2], people
+                )
                 info = CameraInfo.from_intrinsics(
                     focal, focal, cfg.width / 2, cfg.height / 2, cfg.width, cfg.height, frame
                 )

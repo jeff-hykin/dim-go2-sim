@@ -15,9 +15,9 @@
 """Camera frames drawn from a scene's textured glTF with pygfx (after PimSim's mesh renderer),
 or from its Gaussian splats (splat.py).
 
-Cooked scenes' MJCFs are collision-only, so MuJoCo would draw grey boxes. Only the static scene
-is drawn, not the robot: a camera must not see its own body. Rendering runs in a fresh child
-process, since GPU device state cannot cross dimOS's forkserver.
+Cooked scenes' MJCFs are collision-only, so MuJoCo would draw grey boxes. The static scene and any
+people in it are drawn, not the robot: a camera must not see its own body. Rendering runs in a
+fresh child process, since GPU device state cannot cross dimOS's forkserver.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from dim_go2_sim import people as people_shapes
 from dim_go2_sim.config import CameraConfig
 from dim_go2_sim.splat import SplatRenderer, is_splats, load_splats
 
@@ -68,7 +69,7 @@ def focal_length(config: CameraConfig) -> float:
 
 
 class _Renderer:
-    def __init__(self, visual: str, y_up: bool, config: CameraConfig) -> None:
+    def __init__(self, visual: str, y_up: bool, config: CameraConfig, people: int = 0) -> None:
         import pygfx as gfx  # type: ignore[import-untyped]
         from rendercanvas.offscreen import OffscreenRenderCanvas  # type: ignore[import-untyped]
 
@@ -93,6 +94,8 @@ class _Renderer:
         self._scene = gfx.Scene()
         self._background = gfx.Background(None, gfx.BackgroundMaterial(config.background))
         self._scene.add(self._background, *[c.mesh for c in self._chunks])
+        self._people = [_person(gfx, i) for i in range(people)]
+        self._scene.add(*self._people)
         self._scene.add(gfx.AmbientLight("#ffffff", config.ambient))
         sun = gfx.DirectionalLight("#fff4e6", config.sun)
         sun.local.position = (4.0, -6.0, 10.0)
@@ -109,8 +112,16 @@ class _Renderer:
         ]
 
     def capture(
-        self, position: NDArray[np.float64], forward: NDArray[np.float64], up: NDArray[np.float64]
+        self,
+        position: NDArray[np.float64],
+        forward: NDArray[np.float64],
+        up: NDArray[np.float64],
+        people: NDArray[np.float64] | None = None,
     ) -> NDArray[np.uint8]:
+        if people is not None:
+            for person, (x, y, yaw) in zip(self._people, people, strict=True):
+                person.local.position = (x, y, 0.0)
+                person.local.rotation = (0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2))
         # Skip chunks wholly behind the camera, which can't change the image; on a software GPU
         # also small ones out of reach, as a store's tens of millions of vertices are too many.
         offset = self._centers - position
@@ -132,6 +143,30 @@ class _Renderer:
             self._renderer.render(self._scene, camera, clear=not i, flush=False)
         self._renderer.flush()
         return np.ascontiguousarray(np.asarray(self._renderer.snapshot())[:, :, :3])
+
+
+def _person(gfx: Any, index: int) -> Any:
+    """Person *index* as a group of meshes, one per material, in the person's frame."""
+    group = gfx.Group()
+    for material, color in people_shapes.colors(index).items():
+        vertices, faces = people_shapes.mesh(material)
+        geometry = gfx.Geometry(positions=vertices, indices=faces)
+        geometry.normals = gfx.Buffer(_vertex_normals(vertices, faces))
+        group.add(gfx.Mesh(geometry, gfx.MeshPhongMaterial(color=color)))
+    group.local.position = (0.0, 0.0, -100.0)  # out of sight until placed
+    return group
+
+
+def _vertex_normals(
+    vertices: NDArray[np.float32], faces: NDArray[np.uint32]
+) -> NDArray[np.float32]:
+    corners = vertices[faces]
+    face_normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    normals = np.zeros_like(vertices)
+    for k in range(3):
+        np.add.at(normals, faces[:, k], face_normals)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+    return normals.astype(np.float32)
 
 
 def _cap_textures(gfx: Any, root: Any, max_size: int) -> None:
@@ -341,12 +376,12 @@ def _fan(a: int, b: int, c: int, ab: int | None, bc: int | None, ca: int | None)
     return [c, ca, b, ca, a, b]
 
 
-def _serve(visual: str, y_up: bool, config: CameraConfig) -> None:
+def _serve(visual: str, y_up: bool, config: CameraConfig, people: int) -> None:
     renderer: _Renderer | SplatRenderer
     if is_splats(visual):
-        renderer = SplatRenderer(load_splats(visual), config)
+        renderer = SplatRenderer(load_splats(visual), config, people)
     else:
-        renderer = _Renderer(visual, y_up, config)
+        renderer = _Renderer(visual, y_up, config, people)
     out = sys.stdout.buffer
     pickle.dump(None, out)
     out.flush()
@@ -362,12 +397,20 @@ def _serve(visual: str, y_up: bool, config: CameraConfig) -> None:
 
 
 class SceneCamera:
-    """Renders *visual* (a glTF, or .nurec splats) in a child process. Loading a large scene there
-    takes a while."""
+    """Renders *visual* (a glTF, or splats) and *people* people in a child process. Loading a large
+    scene there takes a while."""
 
-    def __init__(self, visual: str, y_up: bool, config: CameraConfig) -> None:
+    def __init__(self, visual: str, y_up: bool, config: CameraConfig, people: int = 0) -> None:
         self._process = subprocess.Popen(
-            [sys.executable, "-m", __name__, visual, json.dumps(y_up), config.model_dump_json()],
+            [
+                sys.executable,
+                "-m",
+                __name__,
+                visual,
+                json.dumps(y_up),
+                config.model_dump_json(),
+                str(people),
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
         )
@@ -380,10 +423,15 @@ class SceneCamera:
             ) from None
 
     def capture(
-        self, position: NDArray[np.float64], forward: NDArray[np.float64], up: NDArray[np.float64]
+        self,
+        position: NDArray[np.float64],
+        forward: NDArray[np.float64],
+        up: NDArray[np.float64],
+        people: NDArray[np.float64] | None = None,
     ) -> NDArray[np.uint8]:
+        """The view from *position*, with each person at their (x, y, yaw) in *people*."""
         assert self._process.stdin is not None and self._process.stdout is not None
-        pickle.dump((position, forward, up), self._process.stdin)
+        pickle.dump((position, forward, up, people), self._process.stdin)
         self._process.stdin.flush()
         rgb: NDArray[np.uint8] = pickle.load(self._process.stdout)
         return rgb
@@ -402,4 +450,9 @@ class SceneCamera:
 
 
 if __name__ == "__main__":
-    _serve(sys.argv[1], json.loads(sys.argv[2]), CameraConfig.model_validate_json(sys.argv[3]))
+    _serve(
+        sys.argv[1],
+        json.loads(sys.argv[2]),
+        CameraConfig.model_validate_json(sys.argv[3]),
+        int(sys.argv[4]),
+    )

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Which scene geometry the robot touches, by robot part and kind of geometry. Ground truth."""
+"""What the robot touches, by robot part and kind: floor, other scene geometry, or a person.
+Ground truth."""
 
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ import mujoco
 import numpy as np
 
 Part = Literal["trunk", "leg", "foot"]
-Kind = Literal["floor", "clutter"]
+Kind = Literal["floor", "clutter", "person"]
 
 
 @dataclass(frozen=True, order=True)
@@ -56,7 +57,8 @@ class Contacts(Timestamped):
 
 
 class ContactSensor:
-    """Classifies each static scene geom once as floor (its top below floor_top_z) or clutter."""
+    """Classifies each static scene geom once as floor (its top below floor_top_z) or clutter, and
+    each person's (a mocap body's) as person."""
 
     def __init__(
         self,
@@ -74,7 +76,12 @@ class ContactSensor:
         self._body = model.geom_bodyid
         self._kind: dict[int, Kind] = {}
         for g in range(model.ngeom):
-            if g in self._robot or model.body_weldid[model.geom_bodyid[g]] != 0:
+            if g in self._robot:
+                continue
+            if model.body_mocapid[model.geom_bodyid[g]] >= 0:
+                self._kind[g] = "person"
+                continue
+            if model.body_weldid[model.geom_bodyid[g]] != 0:
                 continue
             if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE:
                 self._kind[g] = "floor"

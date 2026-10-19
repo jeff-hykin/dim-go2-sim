@@ -28,6 +28,7 @@ from dimos.core.coordination.module_coordinator import ModuleCoordinator
 from dimos.core.core import rpc
 from dimos.core.module import Module
 from dimos.core.stream import In, Out
+from dimos.msgs.geometry_msgs.PoseArray import PoseArray
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
@@ -43,7 +44,17 @@ import pytest
 from dim_go2_sim import Contacts, Go2Sim
 from dim_go2_sim.urdf import MeshFile
 
-STREAMS = ("lidar", "color_image", "camera_info", "imu", "odom", "tf", "contacts", "urdf_info")
+STREAMS = (
+    "lidar",
+    "color_image",
+    "camera_info",
+    "imu",
+    "odom",
+    "tf",
+    "contacts",
+    "people",
+    "urdf_info",
+)
 
 
 class Probe(Module):
@@ -55,6 +66,7 @@ class Probe(Module):
     odom: In[PoseStamped]
     tf: In[TFMessage]
     contacts: In[Contacts]
+    people: In[PoseArray]
     urdf_info: In[String]
     mesh_request: Out[String]
     mesh_info: In[MeshFile]
@@ -196,6 +208,7 @@ def coordinator(tmp_path: Path):
             physics={"cache_dir": str(tmp_path / "cache")},
             camera={"width": 160, "height": 120},
             urdf={"period_s": 60.0},  # only the first send, unless asked
+            people={"count": 1, "routes": [[(2.5, -2.0), (2.5, 2.0)]]},  # crossing ahead
         ),
         Probe.blueprint(),
     )
@@ -235,7 +248,8 @@ def test_shares_its_urdf_and_each_mesh_it_names(coordinator: ModuleCoordinator) 
     assert uri == name and size > 1000
     digest = name.partition("?hash=")[2]
     assert probe.ask_for_mesh(f"{name}&have={digest}") is None  # the asker's copy is fresh
-    assert {"base_link", "FL_hip", "FL_thigh", "RR_calf"} <= set(probe.frames())
+    assert {"base_link", "FL_hip", "FL_thigh", "RR_calf", "person_0"} <= set(probe.frames())
+    assert "person_0" in {link.get("name") for link in ET.fromstring(probe.urdf()).iter("link")}
 
 
 def test_an_empty_mesh_request_gets_the_urdf_now(coordinator: ModuleCoordinator) -> None:

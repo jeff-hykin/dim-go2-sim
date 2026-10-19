@@ -34,6 +34,7 @@ from scipy.spatial.transform import Rotation
 
 from dim_go2_sim.config import LidarConfig
 from dim_go2_sim.mid360 import Mid360, Scan
+from dim_go2_sim.people import GROUP as PEOPLE_GROUP
 from dim_go2_sim.world import LENS_GUARD_GROUP
 
 ROUND_RESOLUTION = 12
@@ -95,11 +96,12 @@ def static_triangles(
 
 
 class Raycaster:
-    """The static world through Embree, the robot through MuJoCo; nearest hit wins.
+    """The static world through Embree, the robot and any people through MuJoCo; nearest hit wins.
 
-    *robot* is the robot alone, whose qpos is the world's from *robot_qpos* on. *static_mesh*
-    (world-frame vertices and faces) stands in for the world's static geoms, when a scene's
-    collision geometry is coarser than its surfaces.
+    *robot* is the robot alone with the world's people (mocap bodies, the world's last ones); its
+    qpos is the world's from *robot_qpos* on. *robot_visible* False casts only its people.
+    *static_mesh* (world-frame vertices and faces) stands in for the world's static geoms, when a
+    scene's collision geometry is coarser than its surfaces.
     """
 
     def __init__(
@@ -110,9 +112,15 @@ class Raycaster:
         robot: mujoco.MjModel | None,
         robot_qpos: int,
         static_mesh: tuple[NDArray[np.float32], NDArray[np.uint32]] | None = None,
+        robot_visible: bool = True,
     ) -> None:
         vertices, faces = static_mesh or static_triangles(
             world, world_data, static_geoms(world, robot_bodies)
+        )
+        # The static scene's extent, but for a floor plane's 2 km.
+        near = vertices[(np.abs(vertices) < 500).all(axis=1)]
+        self.bounds = (
+            (near.min(axis=0), near.max(axis=0)) if len(near) else (np.zeros(3), np.zeros(3))
         )
         self._scene = o3d.t.geometry.RaycastingScene()
         if len(faces):
@@ -123,21 +131,21 @@ class Raycaster:
         self._robot_qpos = robot_qpos
         self._groups = np.ones(6, dtype=np.uint8)
         self._groups[LENS_GUARD_GROUP] = 0  # nothing a laser can hit
+        if not robot_visible:
+            self._groups[:] = 0
+            self._groups[PEOPLE_GROUP] = 1
 
     def cast(
         self, origin: NDArray[np.float64], directions: NDArray[np.float64], max_range: float
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Distance and hit normal (facing the ray) per world-frame unit direction; -1 is a miss."""
-        rays = np.empty((len(directions), 6), np.float32)
-        rays[:, :3] = origin
-        rays[:, 3:] = directions
-        hit = self._scene.cast_rays(o3d.core.Tensor(rays))
-        dist = hit["t_hit"].numpy().astype(np.float64)
-        normals = hit["primitive_normals"].numpy().astype(np.float64)
-        dist[~np.isfinite(dist) | (dist > max_range)] = -1.0
+        dist, normals = self._cast_static(origin, directions, max_range)
         if self._robot is not None and self._robot_data is not None:
             d = self._robot_data
             d.qpos[:] = self._world_data.qpos[self._robot_qpos : self._robot_qpos + len(d.qpos)]
+            if self._robot.nmocap:
+                d.mocap_pos[:] = self._world_data.mocap_pos[-self._robot.nmocap :]
+                d.mocap_quat[:] = self._world_data.mocap_quat[-self._robot.nmocap :]
             mujoco.mj_kinematics(self._robot, d)
             own = np.full(len(directions), -1.0)
             own_normals = np.zeros_like(directions)
@@ -161,6 +169,24 @@ class Raycaster:
         # Embree's normals follow the triangle winding; make them face the ray.
         away = np.einsum("ij,ij->i", normals, directions) > 0
         normals[away] *= -1
+        return dist, normals
+
+    def cast_static(
+        self, origins: NDArray[np.float64], directions: NDArray[np.float64], max_range: float
+    ) -> NDArray[np.float64]:
+        """Each ray's distance to the static scene alone, from its own origin; -1 is a miss."""
+        return self._cast_static(origins, directions, max_range)[0]
+
+    def _cast_static(
+        self, origins: NDArray[np.float64], directions: NDArray[np.float64], max_range: float
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        rays = np.empty((len(directions), 6), np.float32)
+        rays[:, :3] = origins
+        rays[:, 3:] = directions
+        hit = self._scene.cast_rays(o3d.core.Tensor(rays))
+        dist = hit["t_hit"].numpy().astype(np.float64)
+        normals = hit["primitive_normals"].numpy().astype(np.float64)
+        dist[~np.isfinite(dist) | (dist > max_range)] = -1.0
         return dist, normals
 
 

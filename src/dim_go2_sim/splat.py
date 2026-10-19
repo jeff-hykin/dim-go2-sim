@@ -33,6 +33,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from dim_go2_sim.config import CameraConfig
+from dim_go2_sim.people import splats as person_splats
+from dim_go2_sim.people import yaw_rotation
 
 # A splat's quad reaches this many standard deviations, where 3DGS stops drawing it.
 QUAD_SIGMAS = 3.0
@@ -43,6 +45,8 @@ MIN_PIXEL_RADIUS = 0.5477
 SH_COEFFICIENTS = 16  # degree 3
 # Depth keys are 16-bit, so numpy sorts them by radix: ~0.2 mm steps across a house.
 DEPTH_LEVELS = 65535
+SH_C0 = 0.28209479177387814  # degree 0's basis: colour = 0.5 + SH_C0 * coefficient
+PERSON_SIGMA = 0.012  # metres: a person's splats, 2 cm apart, close their surfaces
 
 SHADER = """
 struct Camera {
@@ -406,6 +410,28 @@ def spz(splats: Splats, sh_degree: int = 3) -> bytes:
     return gzip.compress(b"".join(parts), 6)
 
 
+def splats_of(positions: NDArray[np.float32], rgb: NDArray[np.float32]) -> Splats:
+    """Opaque round splats (PERSON_SIGMA) at *positions*, coloured *rgb*."""
+    count = len(positions)
+    return Splats(
+        positions=positions.astype(np.float32),
+        rotations=np.tile(np.array([1, 0, 0, 0], np.float16), (count, 1)),
+        log_scales=np.full((count, 3), math.log(PERSON_SIGMA), np.float16),
+        opacities=np.full(count, 0.99, np.float16),
+        sh=((rgb - 0.5) / SH_C0).astype(np.float16)[:, None, :],
+    )
+
+
+def _concatenated(parts: list[Splats]) -> Splats:
+    """*parts* as one, at the highest spherical-harmonic degree among them (the rest zero)."""
+    k = max(p.sh.shape[1] for p in parts)
+    sh = [np.pad(p.sh, ((0, 0), (0, k - p.sh.shape[1]), (0, 0))) for p in parts]
+    fields = ("positions", "rotations", "log_scales", "opacities")
+    return Splats(
+        *(np.concatenate([getattr(p, f) for p in parts]) for f in fields), np.concatenate(sh)
+    )
+
+
 def _packed_splats(splats: Splats) -> NDArray[np.uint32]:
     """8 words per splat, laid out as the shader reads them."""
     words = np.zeros((len(splats), 8), np.uint32)
@@ -418,20 +444,28 @@ def _packed_splats(splats: Splats) -> NDArray[np.uint32]:
 
 
 class SplatRenderer:
-    """Draws *splats* from a camera pose: position, forward and up in the world frame."""
+    """Draws *splats*, and *people* people among them, from a camera pose: position, forward and up
+    in the world frame. Each person is opaque round splats (people.splats), sorted with the
+    scene's, so a wall hides whoever is behind it."""
 
-    def __init__(self, splats: Splats, config: CameraConfig) -> None:
+    def __init__(self, splats: Splats, config: CameraConfig, people: int = 0) -> None:
         import wgpu  # type: ignore[import-untyped]
 
         from dim_go2_sim.camera import focal_length
 
+        self._scene_count = len(splats)
+        self._people = [person_splats(i) for i in range(people)]
+        if people:
+            hidden = np.float32([0.0, 0.0, -100.0])  # out of sight until placed
+            splats = _concatenated([splats, *(splats_of(p + hidden, c) for p, c in self._people)])
         self._config = config
-        self._positions = splats.positions
+        self._positions = splats.positions.copy()
         # How far each splat's quad can reach, metres, for culling it against the view.
         self._reach = QUAD_SIGMAS * np.exp(splats.log_scales.astype(np.float32).max(axis=1))
         self._focal = focal_length(config)
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
         packed = _packed_splats(splats)
+        self._people_packed = packed[self._scene_count :].copy()
         sh = splats.sh
         if sh.shape[1] < SH_COEFFICIENTS:  # the shader reads degree 3; the rest are zero
             sh = np.concatenate(
@@ -484,7 +518,8 @@ class SplatRenderer:
                 ],
             },
         )
-        resources = [self._camera, self._order, buffer(packed), *(buffer(c) for c in channels)]
+        self._splats = buffer(packed)
+        resources = [self._camera, self._order, self._splats, *(buffer(c) for c in channels)]
         self._bindings = device.create_bind_group(
             layout=self._pipeline.get_bind_group_layout(0),
             entries=[
@@ -517,11 +552,29 @@ class SplatRenderer:
         key = ((high - depth) * (DEPTH_LEVELS / max(high - low, 1e-6))).astype(np.uint16)
         return index[np.argsort(key, kind="stable")].astype(np.uint32)
 
+    def place_people(self, poses: NDArray[np.float64]) -> None:
+        """Moves each person's splats to their pose: x, y, yaw."""
+        if not self._people:
+            return
+        start = self._scene_count
+        for (local, _), (x, y, yaw) in zip(self._people, poses, strict=True):
+            world = local @ yaw_rotation(yaw).T.astype(np.float32) + np.float32([x, y, 0.0])
+            self._positions[start : start + len(local)] = world
+            start += len(local)
+        self._people_packed[:, :3] = self._positions[self._scene_count :].view(np.uint32)
+        self._device.queue.write_buffer(self._splats, self._scene_count * 32, self._people_packed)
+
     def capture(
-        self, position: NDArray[np.float64], forward: NDArray[np.float64], up: NDArray[np.float64]
+        self,
+        position: NDArray[np.float64],
+        forward: NDArray[np.float64],
+        up: NDArray[np.float64],
+        people: NDArray[np.float64] | None = None,
     ) -> NDArray[np.uint8]:
         import wgpu
 
+        if people is not None:
+            self.place_people(people)
         cfg = self._config
         forward = forward / np.linalg.norm(forward)
         right = np.cross(forward, up)

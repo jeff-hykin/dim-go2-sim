@@ -29,6 +29,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from dim_go2_sim.config import CameraConfig, PhysicsConfig
+from dim_go2_sim.people import BODY, People, add_people, collide_with_people
 from dim_go2_sim.policy import (
     COMMAND_SLEW,
     CONTROL_DT,
@@ -56,7 +57,7 @@ FITTED = {
     "leg_mass_scale": 1.616,
 }
 # Bump when the composed model changes, so cached worlds are rebuilt.
-MODEL_VERSION = 2
+MODEL_VERSION = 3
 # A sphere around the nose camera keeps the scene out of its near plane, whose farthest corner
 # is 1.4 near planes away (fovy 60, 4:3), plus what a contact sinks in.
 LENS_GUARD = "lens_guard"
@@ -79,6 +80,7 @@ def go2_spec(fitted: bool) -> mujoco.MjSpec:
         condim=1,  # slides along a wall rather than catching on it
         rgba=[0, 0, 0, 0],
     )
+    collide_with_people(spec)
     if not fitted:
         return spec
     p = FITTED
@@ -101,13 +103,15 @@ def go2_spec(fitted: bool) -> mujoco.MjSpec:
 
 
 def compose(
-    scene_mjcf: Path | None, physics: PhysicsConfig, *, ground: bool = True
+    scene_mjcf: Path | None, physics: PhysicsConfig, *, ground: bool = True, people: int = 0
 ) -> mujoco.MjModel:
-    """The scene (or bare ground, or nothing) with the Go2 under PREFIX, in the fitted options."""
+    """The scene (or bare ground, or nothing) with the Go2 under PREFIX and *people* people, in
+    the fitted options."""
     if scene_mjcf:
         world = mujoco.MjSpec.from_file(str(scene_mjcf))
     else:
         world = _ground() if ground else mujoco.MjSpec()
+    add_people(world, people)
     world.option.timestep = physics.timestep
     world.option.integrator = mujoco.mjtIntegrator.mjINT_EULER
     world.option.cone = mujoco.mjtCone.mjCONE_ELLIPTIC
@@ -126,9 +130,10 @@ def _ground() -> mujoco.MjSpec:
     return spec
 
 
-def load_world(scene_mjcf: Path | None, physics: PhysicsConfig) -> mujoco.MjModel:
+def load_world(scene_mjcf: Path | None, physics: PhysicsConfig, people: int = 0) -> mujoco.MjModel:
     """compose(), cached by everything it is built from: a cooked store takes minutes."""
     parts = [
+        f"people {people}".encode(),
         scene_mjcf.read_bytes() if scene_mjcf else b"ground",
         str(scene_mjcf.stat().st_mtime_ns if scene_mjcf else 0).encode(),
         physics.model_dump_json(include={"timestep", "fitted"}).encode(),
@@ -139,7 +144,7 @@ def load_world(scene_mjcf: Path | None, physics: PhysicsConfig) -> mujoco.MjMode
     path = cache / "dim_go2_sim" / f"{scene_mjcf.stem if scene_mjcf else 'ground'}-{key}.mjb"
     if path.is_file():
         return mujoco.MjModel.from_binary_path(str(path))
-    model = compose(scene_mjcf, physics)
+    model = compose(scene_mjcf, physics, people=people)
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(f".{os.getpid()}.tmp")
     mujoco.mj_saveModel(model, str(partial), None)
@@ -157,10 +162,12 @@ def projected_gravity(quat_wxyz: NDArray[np.float64]) -> NDArray[np.float64]:
 
 
 class Go2World:
-    """The compiled world and the Go2 walking in it under the policy, from a velocity command."""
+    """The compiled world and the Go2 walking in it under the policy, from a velocity command,
+    with any people in it walking their routes (set *people* before reset)."""
 
     def __init__(self, model: mujoco.MjModel, physics: PhysicsConfig) -> None:
         self.model = model
+        self.people: People | None = None
         self.data = mujoco.MjData(model)
         self.physics = physics
         self.policy = OnnxPolicy(physics.policy)
@@ -178,6 +185,13 @@ class Go2World:
         self.feet = tuple(model.geom(PREFIX + leg).id for leg in LEGS)
         self.substeps = max(1, round(CONTROL_DT / model.opt.timestep))
         self.time = 0.0
+        self._people_mocap: list[int] = []
+        while (
+            body := mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_BODY, BODY.format(len(self._people_mocap))
+            )
+        ) >= 0:
+            self._people_mocap.append(int(model.body_mocapid[body]))
 
     def reset(self, x: float, y: float, yaw: float, floor_z: float) -> None:
         """Stand in the policy's default pose with the feet on floor_z, at rest."""
@@ -187,6 +201,9 @@ class Go2World:
         d.qpos[q : q + 3] = [x, y, 0.5]
         d.qpos[q + 3 : q + 7] = yaw_quat(yaw)
         d.qpos[self._qpos] = DEFAULT_POSE
+        if self.people is not None:
+            self.people.reset()
+            self._place_people()
         mujoco.mj_forward(m, d)
         lowest = min(float(d.geom_xpos[g][2] - m.geom_size[g][0]) for g in self.feet)
         d.qpos[q + 2] += floor_z - lowest
@@ -217,6 +234,9 @@ class Go2World:
             d.qvel[self._dofs].copy(),
             walk,
         )
+        if self.people is not None:
+            self.people.step(CONTROL_DT, d.qpos[q : q + 2])
+            self._place_people()
         dt = self.model.opt.timestep
         tau = self.physics.actuator_tau
         alpha = 1.0 if tau <= 0 else dt / (tau + dt)
@@ -229,6 +249,17 @@ class Go2World:
             self.time += dt
             if on_substep is not None:
                 on_substep()
+
+    def _place_people(self) -> None:
+        assert self.people is not None
+        poses = self.people.poses()
+        if len(poses) != len(self._people_mocap):
+            raise ValueError(
+                f"{len(poses)} routes for {len(self._people_mocap)} people in the model"
+            )
+        for mocap, (x, y, yaw) in zip(self._people_mocap, poses, strict=True):
+            self.data.mocap_pos[mocap] = [x, y, 0.0]
+            self.data.mocap_quat[mocap] = yaw_quat(yaw)
 
     def base_pose(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Position and rotation matrix of the body in the world."""

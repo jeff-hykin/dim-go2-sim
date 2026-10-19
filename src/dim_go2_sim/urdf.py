@@ -18,9 +18,9 @@ The XML goes out on urdf_info, each mesh named package://dim_go2_sim/<path>?hash
 file>. A mesh_request for one of those names is answered on mesh_info with the file, named with
 its current hash, unless the request carries &have=<that hash>: the asker's copy is fresh.
 
-The root is world; base_link hangs off it by a floating joint, posed by tf, as is every leg link.
-The scene is fixed at world: its collision surfaces as STL tiles and, for an InteriorGS home, its
-Gaussian splats as one SPZ file.
+The root is world; base_link hangs off it by a floating joint, posed by tf, as is every leg link and
+each person (person_<i>). The scene is fixed at world: its collision surfaces as STL tiles and, for
+a splat scene, its Gaussian splats as one SPZ file.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation
 
+from dim_go2_sim import people as people_shapes
 from dim_go2_sim.config import UrdfConfig
 
 PACKAGE = "dim_go2_sim"
@@ -105,9 +106,10 @@ def share_urdf(
     scene: SceneSource | None,
     config: UrdfConfig,
     cache_dir: Path | None = None,
+    people: int = 0,
 ) -> SharedUrdf:
-    """The URDF of *robot* (the Go2 alone) and *scene*, each link named as its tf frame (after
-    *prefix*), its files built once into the cache."""
+    """The URDF of *robot* (the Go2 alone), *scene* and *people* people, each link named as its tf
+    frame (after *prefix*), its files built once into the cache."""
     cache = cache_dir or Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     root = cache / PACKAGE / "urdf"
     tag = f"{ASSETS_VERSION} {version('dim-go2-sim')}"
@@ -119,6 +121,12 @@ def share_urdf(
     world = prefix + "world"
     ET.SubElement(xml, "link", name=world)
     _robot_links(xml, robot, prefix, json.loads((robot_dir / "parts.json").read_text()))
+    if people:
+        people_dir = _cached(root / f"people-{_digest(tag)}", _write_people)
+        for path in sorted(people_dir.glob("*.stl")):
+            files[f"package://{PACKAGE}/people/{path.name}"] = path
+        for i in range(people):
+            _person_link(xml, world, prefix + people_shapes.BODY.format(i), i)
     if scene is not None:
         settings = (config.scene_faces, config.tile_faces, config.splats_sh_degree)
         scene_dir = _cached(
@@ -232,6 +240,24 @@ def _fixed_link(xml: ET.Element, world: str, name: str, meshes: list[str]) -> No
     joint = ET.SubElement(xml, "joint", name=f"{name}_joint", type="fixed")
     ET.SubElement(joint, "parent", link=world)
     ET.SubElement(joint, "child", link=name)
+
+
+def _person_link(xml: ET.Element, world: str, name: str, index: int) -> None:
+    link = ET.SubElement(xml, "link", name=name)
+    for material, color in people_shapes.colors(index).items():
+        visual = ET.SubElement(link, "visual")
+        uri = f"package://{PACKAGE}/people/person_{material}.stl"
+        ET.SubElement(ET.SubElement(visual, "geometry"), "mesh", filename=uri)
+        element = ET.SubElement(visual, "material", name=f"{name}_{material}")
+        ET.SubElement(element, "color", rgba=_xyz(np.array([*color, 1.0])))
+    joint = ET.SubElement(xml, "joint", name=f"{name}_joint", type="floating")
+    ET.SubElement(joint, "parent", link=world)
+    ET.SubElement(joint, "child", link=name)
+
+
+def _write_people(folder: Path) -> None:
+    for material in ("skin", "shirt", "pants"):
+        (folder / f"person_{material}.stl").write_bytes(stl(*people_shapes.mesh(material)))
 
 
 def _write_robot(model: mujoco.MjModel, folder: Path) -> None:

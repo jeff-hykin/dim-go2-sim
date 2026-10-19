@@ -95,6 +95,24 @@ arbitrary frame and scale, so the first run cooks it (a few seconds):
 Only a scan's degree-0 (view-independent) colour is kept: higher spherical harmonics would have
 to be turned with it. Splats from a 3DGS PLY are drawn as the InteriorGS ones are, evaluated in 3D.
 
+### People
+
+```python
+Go2Sim.blueprint(scene={"package": "supersplat/3f89bbd3"}, people={"count": 2, "speed": 0.4})
+```
+
+People walk slow loops through the scene: 1.69 m tall, 0.47 m across, made of a few capsules and
+a box. Each is a kinematic (mocap) body the robot bumps into and is pushed by, and they pass
+through each other and the scene; a person waits while the robot is within
+`people.yield_distance` ahead of them. The camera draws them (among a splat scene's splats, so
+walls hide them, or as meshes in a glTF scene), the lidar casts them, `contacts` reports touching
+one as `person`, `people` and tf give their poses (`person_<i>`), and `urdf_info` carries them.
+
+Their loops are `people.routes` (each a list of (x, y) waypoints), or else picked by
+`people.seed`: four spots 3 m apart on the open floor reachable from the robot's start, joined
+by the shortest ways that keep 0.4 m from anything up to 1.6 m. Each starts at the first point
+of their loop 2.5 m from the robot.
+
 ## Streams
 
 | stream | type | |
@@ -104,8 +122,9 @@ to be turned with it. Splats from a 3DGS PLY are drawn as the InteriorGS ones ar
 | `color_image`, `camera_info` | `Image`, `CameraInfo` | the nose camera, RGB |
 | `imu` | `Imu` | body angular velocity, specific force and orientation |
 | `odom` | `PoseStamped` | the true body pose in `world` |
-| `tf` | `TFMessage` | `world` → `base_link` → `mid360_link`, `camera_optical`, and each leg link (`FL_hip` → `FL_thigh` → `FL_calf`, ...) |
-| `contacts` | `dim_go2_sim.Contacts` | (robot part, floor/clutter) pairs touching, whenever they change; ground truth for grading |
+| `tf` | `TFMessage` | `world` → `base_link` → `mid360_link`, `camera_optical`, and each leg link (`FL_hip` → `FL_thigh` → `FL_calf`, ...); `world` → `person_<i>` |
+| `contacts` | `dim_go2_sim.Contacts` | (robot part, floor/clutter/person) pairs touching, whenever they change; ground truth for grading |
+| `people` | `PoseArray` | each person's pose in `world` (on the floor, facing their way), with odom; ground truth |
 | `urdf_info` | `std_msgs.String` | the robot and its scene as one URDF, every 5 s, for [dim-controller](https://github.com/jeff-hykin/dim-controller) |
 | `mesh_request` (in), `mesh_info` | `std_msgs.String`, `shape_msgs.MeshFile` | a mesh the URDF names, asked for and sent; an empty request gets `urdf_info` right away |
 
@@ -134,6 +153,7 @@ SPZ file (`scenes/interiorgs_<id>/splats.spz`, world frame, Z up). The files are
 - `camera`: `enabled`, `rate_hz`, `width`, `height`, `fovy_deg`, `xyz`, `pitch_deg`, `near`,
   `far`, `detail_distance`, `simplify`, `max_texture_size`, `ambient`, `sun`, `background`
 - `urdf`: `enabled`, `period_s`, `scene_faces`, `tile_faces`, `splats_sh_degree`
+- `people`: `count`, `speed`, `seed`, `routes`, `yield_distance`
 - `odom_hz`, `imu_hz`, `frame_prefix`
 
 See `src/dim_go2_sim/config.py` for what each means and its default.
