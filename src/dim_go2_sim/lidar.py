@@ -34,6 +34,7 @@ from scipy.spatial.transform import Rotation
 
 from dim_go2_sim.config import LidarConfig
 from dim_go2_sim.mid360 import Mid360, Scan
+from dim_go2_sim.world import LENS_GUARD_GROUP
 
 ROUND_RESOLUTION = 12
 
@@ -121,6 +122,7 @@ class Raycaster:
         self._robot_data = mujoco.MjData(robot) if robot is not None else None
         self._robot_qpos = robot_qpos
         self._groups = np.ones(6, dtype=np.uint8)
+        self._groups[LENS_GUARD_GROUP] = 0  # nothing a laser can hit
 
     def cast(
         self, origin: NDArray[np.float64], directions: NDArray[np.float64], max_range: float

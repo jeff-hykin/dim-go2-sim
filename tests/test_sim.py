@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dim_go2_sim.config import LidarConfig, PhysicsConfig
+from dim_go2_sim.config import CameraConfig, LidarConfig, PhysicsConfig
 from dim_go2_sim.contacts import Contact, ContactSensor
 from dim_go2_sim.lidar import Raycaster, RollingLidar, mount_rotation
 from dim_go2_sim.mid360 import Mid360
@@ -102,6 +102,31 @@ def test_contacts_are_feet_on_floor_until_the_robot_walks_into_the_wall(
         world.tick(np.array([0.5, 0.0, 0.0]))
         touched |= set(sensor.contacts())
     assert any(c.kind == "clutter" for c in touched)
+
+
+def test_the_wall_stays_beyond_the_cameras_near_plane_however_the_robot_walks_into_it(
+    physics: PhysicsConfig, scene: Path
+) -> None:
+    world = Go2World(load_world(scene, physics), physics)
+    camera = CameraConfig()
+    lens = np.array(camera.xyz)
+    # The near plane's farthest corner: any wall nearer cuts into the picture.
+    half_height = math.tan(math.radians(camera.fovy_deg / 2))
+    corner = camera.near * math.hypot(1, half_height, half_height * camera.width / camera.height)
+    model = world.model
+    robot = {b for b in range(model.nbody) if world.is_robot(b)}
+    touched = set()
+    for heading in (-60, -30, 0, 30, 60):
+        world.reset(2.0, 0.0, math.radians(heading), 0.0)
+        sensor = ContactSensor(model, world.data, robot, world.trunk, world.feet, 0.05)
+        closest = math.inf
+        for _ in range(200):
+            world.tick(np.array([1.0, 0.0, 0.0]))
+            position, rotation = world.base_pose()
+            closest = min(closest, 2.95 - (position + rotation @ lens)[0])
+            touched |= set(sensor.contacts())
+        assert corner < closest < corner + 0.05, f"{closest:.3f} m from the wall at {heading}"
+    assert Contact("trunk", "clutter") in touched  # the nose is the trunk's
 
 
 def test_lidar_sees_the_wall_from_a_rolling_scan(physics: PhysicsConfig, scene: Path) -> None:

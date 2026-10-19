@@ -28,7 +28,7 @@ import mujoco
 import numpy as np
 from numpy.typing import NDArray
 
-from dim_go2_sim.config import PhysicsConfig
+from dim_go2_sim.config import CameraConfig, PhysicsConfig
 from dim_go2_sim.policy import (
     COMMAND_SLEW,
     CONTROL_DT,
@@ -56,7 +56,12 @@ FITTED = {
     "leg_mass_scale": 1.616,
 }
 # Bump when the composed model changes, so cached worlds are rebuilt.
-MODEL_VERSION = 1
+MODEL_VERSION = 2
+# A sphere around the nose camera keeps the scene out of its near plane, whose farthest corner
+# is 1.4 near planes away (fovy 60, 4:3), plus what a contact sinks in.
+LENS_GUARD = "lens_guard"
+LENS_GUARD_RADIUS = 1.4 * CameraConfig().near + 0.02
+LENS_GUARD_GROUP = 5  # the lidar's self-occlusion leaves it out
 
 
 def go2_spec(fitted: bool) -> mujoco.MjSpec:
@@ -65,6 +70,15 @@ def go2_spec(fitted: bool) -> mujoco.MjSpec:
     spec.meshdir = str(model_dir / "assets")
     for key in list(spec.keys):
         spec.delete(key)
+    spec.body(ROOT).add_geom(
+        name=LENS_GUARD,
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        size=[LENS_GUARD_RADIUS, 0, 0],
+        pos=CameraConfig().xyz,
+        group=LENS_GUARD_GROUP,
+        condim=1,  # slides along a wall rather than catching on it
+        rgba=[0, 0, 0, 0],
+    )
     if not fitted:
         return spec
     p = FITTED

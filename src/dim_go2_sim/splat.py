@@ -36,9 +36,9 @@ from dim_go2_sim.config import CameraConfig
 
 # A splat's quad reaches this many standard deviations, where 3DGS stops drawing it.
 QUAD_SIGMAS = 3.0
-# 3DGUT, which trained the InteriorGS splats, draws none nearer than this, metres, and none
-# thinner than this many pixels.
-NEAR_CLIP = 0.2
+# 3DGUT, which trained the InteriorGS splats, draws none thinner than this many pixels. (It also
+# skips any nearer than 0.2 m; here only the camera's near plane does, as each pixel's ray is
+# evaluated in 3D, nothing near smears, and a wall 0.2 m off would vanish.)
 MIN_PIXEL_RADIUS = 0.5477
 SH_COEFFICIENTS = 16  # degree 3
 # Depth keys are 16-bit, so numpy sorts them by radix: ~0.2 mm steps across a house.
@@ -508,7 +508,7 @@ class SplatRenderer:
         culled on the GPU: the depth is all the CPU can afford per splat."""
         cfg = self._config
         depth = self._positions @ forward.astype(np.float32) - np.float32(position @ forward)
-        visible = (depth > max(cfg.near, NEAR_CLIP)) & (depth - self._reach < cfg.far)
+        visible = (depth > cfg.near) & (depth - self._reach < cfg.far)
         index = np.flatnonzero(visible)
         if not len(index):
             return index.astype(np.uint32)

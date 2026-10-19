@@ -77,3 +77,19 @@ def test_nothing_behind_the_camera_is_drawn(tmp_path: Path) -> None:
     visual = tmp_path / "behind.nurec"
     write_nurec(visual, positions=[(-2, 0, 0)], scales=[0.5], colors=[(1, 1, 1)])
     assert capture(visual, (1, 0, 0)).max() == 0
+
+
+def test_a_wall_just_past_the_near_plane_hides_what_is_behind_it(tmp_path: Path) -> None:
+    # A red wall of small splats 8 cm ahead (as near as the robot's nose lets one come), green
+    # beyond it: a near clip deeper than the wall would show the green through it.
+    grid = np.arange(-0.2, 0.201, 0.01)
+    wall = [(0.08, y, z) for y in grid for z in grid]
+    visual = tmp_path / "wall.nurec"
+    write_nurec(
+        visual,
+        positions=[*wall, (2, 0, 0)],
+        scales=[0.01] * len(wall) + [1.0],
+        colors=[(1, 0, 0)] * len(wall) + [(0, 1, 0)],
+    )
+    rgb = capture(visual, (1, 0, 0)).astype(int)
+    assert (rgb[:, :, 0] > 150).all() and rgb[:, :, 1].max() < 30, "the wall has holes"
