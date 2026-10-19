@@ -21,6 +21,9 @@ its current hash, unless the request carries &have=<that hash>: the asker's copy
 The root is world; base_link hangs off it by a floating joint, posed by tf, as is every leg link and
 each person (person_<i>). The scene is fixed at world: its collision surfaces as STL tiles and, for
 a splat scene, its Gaussian splats as one SPZ file.
+
+Each scene link carries <group>scene</group> and each person <group>people</group>, a dimos
+extension URDF parsers skip: dim-controller shows and hides each group's links by a row of its own.
 """
 
 from __future__ import annotations
@@ -230,8 +233,14 @@ def _robot_links(
         ET.SubElement(joint, "limit", lower=lower, upper=upper, effort="0", velocity="0")
 
 
-def _fixed_link(xml: ET.Element, world: str, name: str, meshes: list[str]) -> None:
+def _grouped_link(xml: ET.Element, name: str, group: str) -> ET.Element:
     link = ET.SubElement(xml, "link", name=name)
+    ET.SubElement(link, "group").text = group
+    return link
+
+
+def _fixed_link(xml: ET.Element, world: str, name: str, meshes: list[str]) -> None:
+    link = _grouped_link(xml, name, "scene")
     for uri in meshes:
         visual = ET.SubElement(link, "visual")
         ET.SubElement(ET.SubElement(visual, "geometry"), "mesh", filename=uri)
@@ -243,7 +252,7 @@ def _fixed_link(xml: ET.Element, world: str, name: str, meshes: list[str]) -> No
 
 
 def _person_link(xml: ET.Element, world: str, name: str, index: int) -> None:
-    link = ET.SubElement(xml, "link", name=name)
+    link = _grouped_link(xml, name, "people")
     for material, color in people_shapes.colors(index).items():
         visual = ET.SubElement(link, "visual")
         uri = f"package://{PACKAGE}/people/person_{material}.stl"

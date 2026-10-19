@@ -137,6 +137,19 @@ def test_urdf_names_each_mesh_by_its_hash_and_poses_the_legs_by_tf(shared) -> No
     assert len(shared.files) == len(list(robot.iter("mesh")))
 
 
+def test_the_scene_and_the_people_are_each_a_group_the_robot_in_none(tmp_path: Path) -> None:
+    vertices, faces = room()
+    scene = SceneSource("room", "1", lambda: (vertices, faces))
+    xml = share_urdf(go2_spec(False).compile(), "go2/", scene, UrdfConfig(tile_faces=8), tmp_path, people=2).xml
+    groups = {link.get("name"): link.findtext("group") for link in ET.fromstring(xml).iter("link")}
+    assert {name: group for name, group in groups.items() if group} == {
+        "go2/scene_mesh": "scene",
+        "go2/person_0": "people",
+        "go2/person_1": "people",
+    }
+    assert groups["go2/base_link"] is None and groups["go2/world"] is None
+
+
 def test_a_mesh_request_gets_the_file_unless_the_asker_has_it(shared) -> None:
     name, (path, digest) = next(iter(shared.files.items()))
     for request in (name, f"{name}?hash={digest}", f"{name}?hash={digest}&have={'0' * 64}"):
