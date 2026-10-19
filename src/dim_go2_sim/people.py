@@ -197,7 +197,8 @@ class Route:
 
 
 class People:
-    """Where each person is (x, y, yaw), walking their route; they wait for the robot."""
+    """Where each person is (x, y, yaw), walking their route; they wait for the robot when it is
+    in their way, and after config.patience_s turn back and walk their loop the other way."""
 
     def __init__(
         self,
@@ -223,17 +224,23 @@ class People:
             self._along.append(far[0] if far else 0.0)
         self.yaws = [route.at(s)[1] for route, s in zip(self.routes, self._along, strict=True)]
         self.waiting = [False] * len(self.routes)
+        self._waited = [0.0] * len(self.routes)
+        self._direction = [1.0] * len(self.routes)  # along their loop, or back the other way
 
     def step(self, dt: float, robot_xy: NDArray[np.float64]) -> None:
         for i, route in enumerate(self.routes):
             point, heading = route.at(self._along[i])
-            ahead = np.array([math.cos(self.yaws[i]), math.sin(self.yaws[i])])
+            heading += math.pi if self._direction[i] < 0 else 0.0
+            ahead = np.array([math.cos(heading), math.sin(heading)])  # the way they're walking
             offset = robot_xy[:2] - point
             along = float(offset @ ahead)
             across = abs(float(offset[0] * ahead[1] - offset[1] * ahead[0]))
             self.waiting[i] = 0 < along < self.config.yield_distance and across < IN_THE_WAY
+            self._waited[i] = self._waited[i] + dt if self.waiting[i] else 0.0
+            if self._waited[i] >= self.config.patience_s:
+                self._direction[i], self._waited[i] = -self._direction[i], 0.0
             if not self.waiting[i]:
-                self._along[i] += self.config.speed * dt
+                self._along[i] += self._direction[i] * self.config.speed * dt
             turn = (heading - self.yaws[i] + math.pi) % (2 * math.pi) - math.pi
             self.yaws[i] += float(np.clip(turn, -TURN_RATE * dt, TURN_RATE * dt))
 
