@@ -14,8 +14,8 @@
 
 """The Go2 and its scene as one URDF, shared as dimOS's UrdfManager shares one (for dim-controller).
 
-The XML goes out on urdf_info, each mesh named package://dim_go2_sim/<path>?hash=<sha256 of the
-file>. A mesh_request for one of those names is answered on mesh_info with the file, named with
+The XML goes out on robot_description, each mesh named package://dim_go2_sim/<path>?hash=<sha256 of
+the file>. A file_request for one of those names is answered on file_info with the file, named with
 its current hash, unless the request carries &have=<that hash>: the asker's copy is fresh.
 
 The root is world; base_link hangs off it by a floating joint, posed by tf, as is every leg link and
@@ -60,9 +60,9 @@ Mesh = tuple[NDArray[np.float32], NDArray[np.uint32]]  # vertices, triangles
 
 
 class MeshFile(Timestamped):
-    """One mesh file's bytes, named by the URI a URDF uses for it (dimOS's shape_msgs.MeshFile)."""
+    """One file's bytes, named by the URI a URDF uses for it (dimOS's files.MeshFile)."""
 
-    msg_name = "shape_msgs.MeshFile"
+    msg_name = "files.MeshFile"
 
     def __init__(self, uri: str, data: bytes, ts: float | None = None) -> None:
         self.uri = uri
@@ -86,7 +86,7 @@ class SharedUrdf:
     files: dict[str, tuple[Path, str]]  # mesh name without its query -> the file and its sha256
 
     def answer(self, request: str) -> MeshFile | None:
-        """The file a mesh_request asks for, None if the asker has it already; KeyError for a name
+        """The file a file_request asks for, None if the asker has it already; KeyError for a name
         the URDF doesn't use: a request is never a path into the filesystem."""
         name, _, query = request.partition("?")
         path, digest = self.files[name]

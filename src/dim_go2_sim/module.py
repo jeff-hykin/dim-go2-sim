@@ -82,7 +82,7 @@ logger = setup_logger()
 
 # The optical frame's axes (z forward, x right, y down) as columns, in a forward-looking body frame.
 OPTICAL_IN_BODY = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
-# urdf_info goes out at most this often, however many viewers send an empty mesh_request.
+# robot_description goes out at most this often, however many viewers send an empty file_request.
 URDF_MIN_INTERVAL_S = 0.2
 
 
@@ -119,11 +119,11 @@ class Go2Sim(Module):
     # Each person's pose in world (on the floor, facing their heading), with odom.
     people: Out[PoseArray]
     # The robot and scene as a URDF, its meshes named package://dim_go2_sim/<path>?hash=<sha256>;
-    # any of those names on mesh_request gets the file on mesh_info, unless it has &have=<sha256>;
-    # an empty mesh_request gets urdf_info now, for a viewer that just connected.
-    urdf_info: Out[String]
-    mesh_request: In[String]
-    mesh_info: Out[MeshFile]
+    # any of those names on file_request gets the file on file_info, unless it has &have=<sha256>;
+    # an empty file_request gets robot_description now, for a viewer that just connected.
+    robot_description: Out[String]
+    file_request: In[String]
+    file_info: Out[MeshFile]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -136,8 +136,8 @@ class Go2Sim(Module):
         self._people_poses = np.zeros((0, 3))
         self._clock_origin = 0.0
         self._shared_urdf: SharedUrdf | None = None
-        self._mesh_requests: list[str] = []
-        self._mesh_wanted = threading.Condition()
+        self._file_requests: list[str] = []
+        self._file_wanted = threading.Condition()
         self._urdf_wanted = threading.Event()
 
     @rpc
@@ -194,10 +194,10 @@ class Go2Sim(Module):
         self._stop.clear()
         self._threads = [threading.Thread(target=self._run, name="go2-sim", daemon=True)]
         if cfg.urdf.enabled:
-            self.register_disposable(Disposable(self.mesh_request.subscribe(self._on_mesh_request)))
+            self.register_disposable(Disposable(self.file_request.subscribe(self._on_file_request)))
             self._threads += [
                 threading.Thread(target=self._share_urdf, args=(scene,), daemon=True),
-                threading.Thread(target=self._answer_mesh_requests, daemon=True),
+                threading.Thread(target=self._answer_file_requests, daemon=True),
             ]
         if cfg.camera.enabled and scene.visual is not None:
             self._threads.append(
@@ -212,8 +212,8 @@ class Go2Sim(Module):
     def stop(self) -> None:
         self._stop.set()
         self._urdf_wanted.set()
-        with self._mesh_wanted:
-            self._mesh_wanted.notify_all()
+        with self._file_wanted:
+            self._file_wanted.notify_all()
         for thread in self._threads:
             thread.join(timeout=10)
         super().stop()
@@ -257,41 +257,41 @@ class Go2Sim(Module):
         )
         self._shared_urdf = shared
         logger.info(
-            f"urdf_info: {len(shared.files)} mesh files, "
+            f"robot_description: {len(shared.files)} files, "
             f"{sum(p.stat().st_size for p, _ in shared.files.values()) / 1e6:.1f} MB, "
             f"ready in {time.monotonic() - started:.1f} s"
         )
         while not self._stop.is_set():
             self._urdf_wanted.clear()
-            self.urdf_info.publish(String(shared.xml))
+            self.robot_description.publish(String(shared.xml))
             sent = time.monotonic()
-            self._urdf_wanted.wait(cfg.urdf.period_s)  # an empty mesh_request sends it sooner
+            self._urdf_wanted.wait(cfg.urdf.period_s)  # an empty file_request sends it sooner
             self._stop.wait(sent + URDF_MIN_INTERVAL_S - time.monotonic())  # however many ask
 
-    def _on_mesh_request(self, request: String) -> None:
+    def _on_file_request(self, request: String) -> None:
         if not request.data:
             self._urdf_wanted.set()
             return
-        with self._mesh_wanted:
-            self._mesh_requests.append(request.data)
-            self._mesh_wanted.notify()
+        with self._file_wanted:
+            self._file_requests.append(request.data)
+            self._file_wanted.notify()
 
-    def _answer_mesh_requests(self) -> None:
+    def _answer_file_requests(self) -> None:
         """One at a time, off the transport's thread: a file can be tens of MB."""
         while not self._stop.is_set():
-            with self._mesh_wanted:
-                while not self._mesh_requests and not self._stop.is_set():
-                    self._mesh_wanted.wait()
-                requests, self._mesh_requests = self._mesh_requests, []
+            with self._file_wanted:
+                while not self._file_requests and not self._stop.is_set():
+                    self._file_wanted.wait()
+                requests, self._file_requests = self._file_requests, []
             for request in dict.fromkeys(requests):
                 shared = self._shared_urdf
                 try:
-                    mesh = shared.answer(request) if shared is not None else None
+                    file = shared.answer(request) if shared is not None else None
                 except KeyError:
-                    logger.warning(f"mesh_request for {request!r}: not a mesh in urdf_info")
+                    logger.warning(f"file_request for {request!r}: not a file in robot_description")
                     continue
-                if mesh is not None:
-                    self.mesh_info.publish(mesh)
+                if file is not None:
+                    self.file_info.publish(file)
 
     def _lidar_pose(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         position, rotation = self.world.base_pose()
@@ -477,7 +477,7 @@ class ResolvedScene:
     spawns: tuple[tuple[float, float, float], ...] = ()  # x, y, yaw
     # What the lidar casts against in place of the MJCF's static geoms: vertices and faces.
     lidar_mesh: tuple[NDArray[np.float32], NDArray[np.uint32]] | None = None
-    name: str | None = None  # names the scene's files in urdf_info; None for bare ground
+    name: str | None = None  # names the scene's files in robot_description; None for bare ground
     key: str = ""  # changes whenever the files it is built from do
 
 

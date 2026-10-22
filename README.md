@@ -112,7 +112,7 @@ through each other and the scene; a person waits while the robot is within
 `people.yield_distance` ahead of them or right beside them, and after `people.patience_s` turns back
 and walks their loop the other way. The camera draws them (among a splat scene's splats, so
 walls hide them, or as meshes in a glTF scene), the lidar casts them, `contacts` reports touching
-one as `person`, `people` and tf give their poses (`person_<i>`), and `urdf_info` carries them.
+one as `person`, `people` and tf give their poses (`person_<i>`), and `robot_description` carries them.
 
 Their loops are `people.routes` (each a list of (x, y) waypoints), or else picked by
 `people.seed`: four spots 3 m apart on the open floor reachable from the robot's start, joined
@@ -131,14 +131,14 @@ of their loop 2.5 m from the robot.
 | `tf` | `TFMessage` | `world` → `base_link` → `mid360_link`, `camera_optical`, and each leg link (`FL_hip` → `FL_thigh` → `FL_calf`, ...); `world` → `person_<i>` |
 | `contacts` | `dim_go2_sim.Contacts` | (robot part, floor/clutter/person) pairs touching, whenever they change; ground truth for grading |
 | `people` | `PoseArray` | each person's pose in `world` (on the floor, facing their way), with odom; ground truth |
-| `urdf_info` | `std_msgs.String` | the robot and its scene as one URDF, every 5 s, for [dim-controller](https://github.com/jeff-hykin/dim-controller) |
-| `mesh_request` (in), `mesh_info` | `std_msgs.String`, `shape_msgs.MeshFile` | a mesh the URDF names, asked for and sent; an empty request gets `urdf_info` right away |
+| `robot_description` | `std_msgs.String` | the robot and its scene as one URDF, every 5 s, for [dim-controller](https://github.com/jeff-hykin/dim-controller) |
+| `file_request` (in), `file_info` | `std_msgs.String`, `files.MeshFile` | a file the URDF names, asked for and sent; an empty request gets `robot_description` right away |
 
 ### The URDF
 
 As dimOS's `UrdfManager` shares one: each mesh is named
-`package://dim_go2_sim/<path>?hash=<sha256 of the file>`, and that name on `mesh_request` gets
-the file on `mesh_info` (named with its current hash) unless the request ends `&have=<that
+`package://dim_go2_sim/<path>?hash=<sha256 of the file>`, and that name on `file_request` gets
+the file on `file_info` (named with its current hash) unless the request ends `&have=<that
 hash>`. The root link is `world`; `base_link` hangs off it by a floating joint and each link is
 posed by its tf frame. The scene is fixed at `world`: `scene_mesh` is its collision surfaces,
 simplified to `urdf.scene_faces` triangles in STL tiles (`scenes/<scene>/mesh_000.stl`, ...),

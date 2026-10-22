@@ -108,7 +108,7 @@ class CameraConfig(BaseModel):
 
 class PeopleConfig(BaseModel):
     # People walking slow loops on open floor: kinematic bodies the robot collides with, drawn by
-    # the camera, cast by the lidar, posed on the people stream, in urdf_info and on tf.
+    # the camera, cast by the lidar, posed on the people stream, in robot_description and on tf.
     count: int = Field(default=0, ge=0)
     speed: float = Field(default=0.4, gt=0.0)  # m/s
     seed: int = 0  # picks the loops, when routes doesn't
@@ -122,10 +122,10 @@ class PeopleConfig(BaseModel):
 
 
 class UrdfConfig(BaseModel):
-    # The robot and its scene as one URDF on urdf_info, each mesh on mesh_request -> mesh_info, as
-    # dimOS's UrdfManager shares one (for dim-controller); the leg links go on tf too.
+    # The robot and its scene as one URDF on robot_description, each file on file_request ->
+    # file_info, as dimOS's UrdfManager shares one (for dim-controller); the leg links go on tf too.
     enabled: bool = True
-    period_s: float = Field(default=5.0, gt=0.0)  # urdf_info is re-sent; nothing is latched
+    period_s: float = Field(default=5.0, gt=0.0)  # robot_description is re-sent; nothing is latched
     # The scene's surfaces are simplified to about this many triangles, in STL files of at most
     # tile_faces (50 bytes each).
     scene_faces: int = Field(default=1_000_000, ge=1)

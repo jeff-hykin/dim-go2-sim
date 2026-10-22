@@ -152,7 +152,15 @@ def test_the_scene_and_the_people_are_each_a_group_the_robot_in_none(tmp_path: P
     assert groups["go2/base_link"] is None and groups["go2/world"] is None
 
 
-def test_a_mesh_request_gets_the_file_unless_the_asker_has_it(shared) -> None:
+def test_a_file_goes_out_as_dimos_files_meshfile() -> None:
+    """files.MeshFile on the wire: f64 ts, u32 URI length (little-endian), the URI, the bytes."""
+    uri = "package://dim_go2_sim/go2/base_black.stl?hash=ab"
+    encoded = MeshFile(uri, b"\x00solid\xff", ts=1.5).lcm_encode()
+    assert MeshFile.msg_name == "files.MeshFile"
+    assert encoded == struct.pack("<dI", 1.5, len(uri)) + uri.encode() + b"\x00solid\xff"
+
+
+def test_a_file_request_gets_the_file_unless_the_asker_has_it(shared) -> None:
     name, (path, digest) = next(iter(shared.files.items()))
     for request in (name, f"{name}?hash={digest}", f"{name}?hash={digest}&have={'0' * 64}"):
         mesh = MeshFile.lcm_decode(shared.answer(request).lcm_encode())

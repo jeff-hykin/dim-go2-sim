@@ -53,7 +53,7 @@ STREAMS = (
     "tf",
     "contacts",
     "people",
-    "urdf_info",
+    "robot_description",
 )
 
 
@@ -67,9 +67,9 @@ class Probe(Module):
     tf: In[TFMessage]
     contacts: In[Contacts]
     people: In[PoseArray]
-    urdf_info: In[String]
-    mesh_request: Out[String]
-    mesh_info: In[MeshFile]
+    robot_description: In[String]
+    file_request: Out[String]
+    file_info: In[MeshFile]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -80,7 +80,7 @@ class Probe(Module):
     @rpc
     def start(self) -> None:
         super().start()
-        for name in (*STREAMS, "mesh_info"):
+        for name in (*STREAMS, "file_info"):
             getattr(self, name).subscribe(lambda msg, name=name: self._on(name, msg))
 
     def _on(self, name: str, msg: Any) -> None:
@@ -114,35 +114,35 @@ class Probe(Module):
     @rpc
     def urdf(self) -> str:
         with self._lock:
-            return str(self._last["urdf_info"].data)
+            return str(self._last["robot_description"].data)
 
     @rpc
-    def ask_for_mesh(self, name: str) -> tuple[str, int] | None:
-        """The name and size of the file mesh_info answers *name* with, within 10 s."""
+    def ask_for_file(self, name: str) -> tuple[str, int] | None:
+        """The name and size of the file file_info answers *name* with, within 10 s."""
         with self._lock:
-            before = self._counts["mesh_info"]
-        self.mesh_request.publish(String(name))
+            before = self._counts["file_info"]
+        self.file_request.publish(String(name))
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             with self._lock:
-                if self._counts["mesh_info"] > before:
-                    mesh = self._last["mesh_info"]
+                if self._counts["file_info"] > before:
+                    mesh = self._last["file_info"]
                     return mesh.uri, len(mesh.data)
             time.sleep(0.1)
         return None
 
     @rpc
     def ask_for_urdf(self) -> float | None:
-        """Seconds until urdf_info answers an empty mesh_request, None if mesh_info answers it."""
+        """Seconds until robot_description answers an empty file_request; None if file_info does."""
         with self._lock:
             before = dict(self._counts)
         asked = time.monotonic()
-        self.mesh_request.publish(String(""))
+        self.file_request.publish(String(""))
         while time.monotonic() < asked + 10:
             with self._lock:
-                if self._counts["mesh_info"] > before.get("mesh_info", 0):
+                if self._counts["file_info"] > before.get("file_info", 0):
                     return None
-                if self._counts["urdf_info"] > before.get("urdf_info", 0):
+                if self._counts["robot_description"] > before.get("robot_description", 0):
                     return time.monotonic() - asked
             time.sleep(0.01)
         return None
@@ -211,7 +211,7 @@ def coordinator(tmp_path: Path):
             people={"count": 1, "routes": [[(2.5, -2.0), (2.5, 2.0)]]},  # crossing ahead
         ),
         Probe.blueprint(),
-    )
+    ).global_config(zenoh_scout_addr="224.0.0.231:7446")  # apart from any robot or sim running here
     coordinator = ModuleCoordinator.build(blueprint)
     try:
         yield coordinator
@@ -236,27 +236,27 @@ def test_drives_and_publishes_every_stream(coordinator: ModuleCoordinator) -> No
     assert probe.image_spread() > 5  # the red cube, not just background
 
 
-def test_shares_its_urdf_and_each_mesh_it_names(coordinator: ModuleCoordinator) -> None:
+def test_shares_its_urdf_and_each_file_it_names(coordinator: ModuleCoordinator) -> None:
     probe = coordinator.get_instance(Probe)
     deadline = time.monotonic() + 60
-    while time.monotonic() < deadline and "urdf_info" not in probe.counts():
+    while time.monotonic() < deadline and "robot_description" not in probe.counts():
         time.sleep(0.5)
     meshes = [m.get("filename") for m in ET.fromstring(probe.urdf()).iter("mesh")]
     name = meshes[0]
     assert name.startswith("package://dim_go2_sim/go2/") and "?hash=" in name
-    uri, size = probe.ask_for_mesh(name)
+    uri, size = probe.ask_for_file(name)
     assert uri == name and size > 1000
     digest = name.partition("?hash=")[2]
-    assert probe.ask_for_mesh(f"{name}&have={digest}") is None  # the asker's copy is fresh
+    assert probe.ask_for_file(f"{name}&have={digest}") is None  # the asker's copy is fresh
     assert {"base_link", "FL_hip", "FL_thigh", "RR_calf", "person_0"} <= set(probe.frames())
     assert "person_0" in {link.get("name") for link in ET.fromstring(probe.urdf()).iter("link")}
 
 
-def test_an_empty_mesh_request_gets_the_urdf_now(coordinator: ModuleCoordinator) -> None:
+def test_an_empty_file_request_gets_the_urdf_now(coordinator: ModuleCoordinator) -> None:
     probe = coordinator.get_instance(Probe)
     deadline = time.monotonic() + 60
-    while time.monotonic() < deadline and "urdf_info" not in probe.counts():
+    while time.monotonic() < deadline and "robot_description" not in probe.counts():
         time.sleep(0.5)
     time.sleep(0.3)  # past the rate limit of the first send
     assert probe.ask_for_urdf() < 1.0  # not the 60 s period
-    assert "mesh_info" not in probe.counts()
+    assert "file_info" not in probe.counts()
