@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -435,6 +436,7 @@ class Go2Sim(Module):
 
     def _run_camera(self, visual: str, y_up: bool) -> None:
         from dim_go2_sim.camera import SceneCamera, focal_length
+        from dim_go2_sim.splat import FRAMES_IN_FLIGHT
 
         cfg = self.config.camera
         camera = SceneCamera(visual, y_up, cfg, self.config.people.count)
@@ -443,19 +445,26 @@ class Go2Sim(Module):
         frame = self.frames["camera_optical"]
         period = 1.0 / cfg.rate_hz
         next_frame = time.monotonic()
+        in_flight: deque[float] = deque()  # the stamps of the frames being drawn
         try:
             while not self._stop.wait(max(0.0, next_frame - time.monotonic())):
-                next_frame = max(next_frame + period, time.monotonic())
+                # On schedule: a wait that overslept (macOS coalesces timers under load) is made
+                # up by the next, unless the camera has fallen a whole frame behind.
+                next_frame = max(next_frame + period, time.monotonic() - period)
                 with self._lock:
                     pose, people = self._pose, self._people_poses.copy()
                 if pose is None:
                     continue
                 position, rotation = pose
-                stamp = time.time()
                 eye = rotation @ mount
-                rgb = camera.capture(
-                    position + rotation @ np.array(cfg.xyz), eye[:, 0], eye[:, 2], people
-                )
+                # Frames are drawn while earlier ones are read back and published, so the GPU's
+                # latency (it is shared) need not fit in a period, only its work.
+                in_flight.append(time.time())
+                camera.submit(position + rotation @ np.array(cfg.xyz), eye[:, 0], eye[:, 2], people)
+                if len(in_flight) < FRAMES_IN_FLIGHT:
+                    continue
+                stamp = in_flight.popleft()
+                rgb = camera.collect()
                 info = CameraInfo.from_intrinsics(
                     focal, focal, cfg.width / 2, cfg.height / 2, cfg.width, cfg.height, frame
                 )

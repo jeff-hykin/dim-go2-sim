@@ -83,9 +83,9 @@ class LidarConfig(BaseModel):
 
 class CameraConfig(BaseModel):
     enabled: bool = True
-    rate_hz: float = 10.0
-    width: int = 640
-    height: int = 480
+    rate_hz: float = 20.0
+    width: int = 1920
+    height: int = 1080
     fovy_deg: float = 60.0
     # The Go2's nose camera, from the body origin, looking straight ahead.
     xyz: tuple[float, float, float] = (0.32715, -0.00003, 0.04297)

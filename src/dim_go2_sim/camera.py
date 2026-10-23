@@ -385,6 +385,7 @@ def _serve(visual: str, y_up: bool, config: CameraConfig, people: int) -> None:
     out = sys.stdout.buffer
     pickle.dump(None, out)
     out.flush()
+    drawn: list[NDArray[np.uint8]] = []  # a renderer that can't pipeline draws on submit
     while True:
         try:
             request = pickle.load(sys.stdin.buffer)
@@ -392,8 +393,14 @@ def _serve(visual: str, y_up: bool, config: CameraConfig, people: int) -> None:
             break
         if request is None:
             break
-        pickle.dump(renderer.capture(*request), out, protocol=pickle.HIGHEST_PROTOCOL)
-        out.flush()
+        if request == "collect":
+            rgb = drawn.pop(0) if drawn else renderer.collect()  # type: ignore[union-attr]
+            pickle.dump(rgb, out, protocol=pickle.HIGHEST_PROTOCOL)
+            out.flush()
+        elif isinstance(renderer, SplatRenderer):
+            renderer.submit(*request)
+        else:
+            drawn.append(renderer.capture(*request))
 
 
 class SceneCamera:
@@ -430,8 +437,27 @@ class SceneCamera:
         people: NDArray[np.float64] | None = None,
     ) -> NDArray[np.uint8]:
         """The view from *position*, with each person at their (x, y, yaw) in *people*."""
-        assert self._process.stdin is not None and self._process.stdout is not None
+        self.submit(position, forward, up, people)
+        return self.collect()
+
+    def submit(
+        self,
+        position: NDArray[np.float64],
+        forward: NDArray[np.float64],
+        up: NDArray[np.float64],
+        people: NDArray[np.float64] | None = None,
+    ) -> None:
+        """Starts drawing a view, as capture() would; collect() returns it. Submitting the next
+        before collecting this one keeps the GPU drawing while this one is read back (two can be
+        in flight)."""
+        assert self._process.stdin is not None
         pickle.dump((position, forward, up, people), self._process.stdin)
+        self._process.stdin.flush()
+
+    def collect(self) -> NDArray[np.uint8]:
+        """The earliest submitted view not yet collected."""
+        assert self._process.stdin is not None and self._process.stdout is not None
+        pickle.dump("collect", self._process.stdin)
         self._process.stdin.flush()
         rgb: NDArray[np.uint8] = pickle.load(self._process.stdout)
         return rgb

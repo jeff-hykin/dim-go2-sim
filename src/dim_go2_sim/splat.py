@@ -14,7 +14,7 @@
 
 """Camera frames drawn from a 3D Gaussian splat with wgpu (Metal, Vulkan, or lavapipe).
 
-Each frame the splats in view are sorted far to near on the CPU, then drawn as instanced quads
+Each frame the splats in view are sorted far to near on the GPU, then drawn as instanced quads
 over their projected ellipses (EWA, as 3DGS) and blended over the ones behind. Within a quad,
 each pixel's ray is evaluated against the splat in 3D, as 3DGUT (which trained the InteriorGS
 splats) does: a linearised projection smears splats near the camera across the image. Colour is
@@ -23,11 +23,13 @@ degree-3 spherical harmonics, evaluated per view on the GPU.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import gzip
 import math
 from pathlib import Path
 import struct
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -43,22 +45,108 @@ QUAD_SIGMAS = 3.0
 # evaluated in 3D, nothing near smears, and a wall 0.2 m off would vanish.)
 MIN_PIXEL_RADIUS = 0.5477
 SH_COEFFICIENTS = 16  # degree 3
-# Depth keys are 16-bit, so numpy sorts them by radix: ~0.2 mm steps across a house.
+# Depth keys are 16-bit, so the GPU sorts them by counting: ~0.2 mm steps across a house.
 DEPTH_LEVELS = 65535
 SH_C0 = 0.28209479177387814  # degree 0's basis: colour = 0.5 + SH_C0 * coefficient
+FRAMES_IN_FLIGHT = 2  # one read back while the next is drawn (wgpu polls wait on all)
 PERSON_SIGMA = 0.012  # metres: a person's splats, 2 cm apart, close their surfaces
 
-SHADER = """
+# What the render and sort shaders share: the camera, and each splat's footprint on the image.
+COMMON = """
 struct Camera {
     rotation: mat4x4<f32>,  // world to optical (x right, y down, z forward), as columns
     position: vec4<f32>,
     focal: vec2<f32>,
     size: vec2<f32>,
+    near: f32,
+    far: f32,
+    count: u32,  // splats
 };
-@group(0) @binding(0) var<uniform> camera: Camera;
-@group(0) @binding(1) var<storage, read> order: array<u32>;
+
 // Per splat, 8 words: position (3 x f32), then f16 pairs: (w, x) (y, z) of the rotation,
 // (log sx, log sy), (log sz, opacity).
+fn splat_position(index: u32) -> vec3<f32> {
+    let base = index * 8u;
+    return vec3<f32>(
+        bitcast<f32>(splats[base]), bitcast<f32>(splats[base + 1u]), bitcast<f32>(splats[base + 2u])
+    );
+}
+
+fn optical(index: u32) -> vec3<f32> {
+    let view = mat3x3<f32>(camera.rotation[0].xyz, camera.rotation[1].xyz, camera.rotation[2].xyz);
+    return view * (splat_position(index) - camera.position.xyz);
+}
+
+struct Footprint {
+    t: vec3<f32>,  // the centre in the optical frame
+    r: mat3x3<f32>,  // the splat's axes in the optical frame, as columns
+    scale: vec3<f32>,
+    opacity: f32,
+    center: vec2<f32>,  // pixels
+    axis: vec2<f32>,  // of the projected ellipse's major axis
+    major: f32,  // variances along it and across, pixels squared
+    minor: f32,
+    // Standard deviations its quad reaches: QUAD_SIGMAS, or less where a faint splat's alpha has
+    // fallen under the 1/255 a fragment needs; 0 if it never reaches that.
+    extent: f32,
+};
+
+fn footprint(index: u32) -> Footprint {
+    var out: Footprint;
+    let base = index * 8u;
+    let wx = unpack2x16float(splats[base + 3u]);
+    let yz = unpack2x16float(splats[base + 4u]);
+    let sxy = unpack2x16float(splats[base + 5u]);
+    let szo = unpack2x16float(splats[base + 6u]);
+    let view = mat3x3<f32>(camera.rotation[0].xyz, camera.rotation[1].xyz, camera.rotation[2].xyz);
+    let t = optical(index);
+
+    let q = normalize(vec4<f32>(wx.x, wx.y, yz.x, yz.y));  // w x y z
+    let w = q.x; let x = q.y; let y = q.z; let z = q.w;
+    let r = view * mat3x3<f32>(
+        vec3<f32>(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y)),
+        vec3<f32>(2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x)),
+        vec3<f32>(2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)),
+    );
+    let f = camera.focal;
+    // As 3DGUT's minimum projected ray radius: no splat is thinner than about half a pixel.
+    let scale = max(exp(vec3<f32>(sxy, szo.x)), vec3<f32>(MIN_PIXEL_RADIUS * t.z / f.x));
+    let m = r * mat3x3<f32>(
+        vec3<f32>(scale.x, 0.0, 0.0), vec3<f32>(0.0, scale.y, 0.0), vec3<f32>(0.0, 0.0, scale.z)
+    );
+    // The quad bounds the splat's projected 2D covariance (EWA splatting).
+    let j = mat3x2<f32>(  // the projection's Jacobian, columns
+        vec2<f32>(f.x / t.z, 0.0), vec2<f32>(0.0, f.y / t.z),
+        vec2<f32>(-f.x * t.x / (t.z * t.z), -f.y * t.y / (t.z * t.z)),
+    );
+    let cov = j * (m * transpose(m)) * transpose(j);
+    let a = cov[0][0]; let b = cov[0][1]; let c = cov[1][1];
+    let mid = 0.5 * (a + c);
+    let radius = sqrt(max(0.25 * (a - c) * (a - c) + b * b, 0.0));
+    out.major = mid + radius;
+    out.minor = max(mid - radius, 1e-6);
+    out.axis = vec2<f32>(1.0, 0.0);
+    if abs(b) > 1e-12 { out.axis = normalize(vec2<f32>(b, out.major - a)); }
+    else if c > a { out.axis = vec2<f32>(0.0, 1.0); }
+    out.center = vec2<f32>(f.x * t.x / t.z, f.y * t.y / t.z) + 0.5 * camera.size;
+    out.t = t;
+    out.r = r;
+    out.scale = scale;
+    out.opacity = szo.y;
+    out.extent = min(QUAD_SIGMAS, sqrt(2.0 * log(max(255.0 * min(szo.y, 0.99), 1.0))));
+    return out;
+}
+
+fn on_screen(p: Footprint) -> bool {
+    let reach = p.extent * sqrt(p.major);
+    let inside = all(p.center >= vec2<f32>(-reach)) && all(p.center <= camera.size + reach);
+    return p.extent > 0.0 && inside;
+}
+"""
+
+SHADER = """
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var<storage, read> order: array<u32>;
 @group(0) @binding(2) var<storage, read> splats: array<u32>;
 // Per splat and colour channel, 16 f16 spherical-harmonic coefficients in 8 words.
 @group(0) @binding(3) var<storage, read> sh_red: array<u32>;
@@ -108,63 +196,24 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     var out: Varyings;
     out.position = vec4<f32>(0.0, 0.0, 2.0, 1.0);  // outside the clip volume: drawn nowhere
     let index = order[instance];
-    let base = index * 8u;
-    let world = vec3<f32>(
-        bitcast<f32>(splats[base]), bitcast<f32>(splats[base + 1u]), bitcast<f32>(splats[base + 2u])
-    );
-    let wx = unpack2x16float(splats[base + 3u]);
-    let yz = unpack2x16float(splats[base + 4u]);
-    let sxy = unpack2x16float(splats[base + 5u]);
-    let szo = unpack2x16float(splats[base + 6u]);
-    let view = mat3x3<f32>(camera.rotation[0].xyz, camera.rotation[1].xyz, camera.rotation[2].xyz);
-    let t = view * (world - camera.position.xyz);
+    let p = footprint(index);
+    if !on_screen(p) { return out; }
 
-    let q = normalize(vec4<f32>(wx.x, wx.y, yz.x, yz.y));  // w x y z
-    let w = q.x; let x = q.y; let y = q.z; let z = q.w;
-    let r = view * mat3x3<f32>(  // the splat's axes in the optical frame, as columns
-        vec3<f32>(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y)),
-        vec3<f32>(2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x)),
-        vec3<f32>(2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)),
-    );
-    let f = camera.focal;
-    // As 3DGUT's minimum projected ray radius: no splat is thinner than about half a pixel.
-    let scale = max(exp(vec3<f32>(sxy, szo.x)), vec3<f32>(MIN_PIXEL_RADIUS * t.z / f.x));
-    let m = r * mat3x3<f32>(
-        vec3<f32>(scale.x, 0.0, 0.0), vec3<f32>(0.0, scale.y, 0.0), vec3<f32>(0.0, 0.0, scale.z)
-    );
-    // The quad bounds the splat's projected 2D covariance (EWA splatting).
-    let j = mat3x2<f32>(  // the projection's Jacobian, columns
-        vec2<f32>(f.x / t.z, 0.0), vec2<f32>(0.0, f.y / t.z),
-        vec2<f32>(-f.x * t.x / (t.z * t.z), -f.y * t.y / (t.z * t.z)),
-    );
-    let cov = j * (m * transpose(m)) * transpose(j);
-    let a = cov[0][0]; let b = cov[0][1]; let c = cov[1][1];
-    let mid = 0.5 * (a + c);
-    let radius = sqrt(max(0.25 * (a - c) * (a - c) + b * b, 0.0));
-    let major = mid + radius;
-    let minor = max(mid - radius, 1e-6);
-    var axis = vec2<f32>(1.0, 0.0);
-    if abs(b) > 1e-12 { axis = normalize(vec2<f32>(b, major - a)); }
-    else if c > a { axis = vec2<f32>(0.0, 1.0); }
-    let center = vec2<f32>(f.x * t.x / t.z, f.y * t.y / t.z) + 0.5 * camera.size;
-    let reach = QUAD_SIGMAS * sqrt(major);
-    if any(center < vec2<f32>(-reach)) || any(center > camera.size + reach) { return out; }
-
-    let corner = (vec2<f32>(f32(vertex & 1u), f32(vertex >> 1u)) * 2.0 - 1.0) * QUAD_SIGMAS;
-    let normal = vec2<f32>(-axis.y, axis.x);
-    let pixel = center + corner.x * sqrt(major) * axis + corner.y * sqrt(minor) * normal;
+    let corner = (vec2<f32>(f32(vertex & 1u), f32(vertex >> 1u)) * 2.0 - 1.0) * p.extent;
+    let normal = vec2<f32>(-p.axis.y, p.axis.x);
+    let pixel = p.center + corner.x * sqrt(p.major) * p.axis + corner.y * sqrt(p.minor) * normal;
     let ndc = pixel / camera.size * 2.0 - 1.0;
     out.position = vec4<f32>(ndc.x, -ndc.y, 0.5, 1.0);
     // Within the quad, each pixel's ray is evaluated against the splat in 3D, as 3DGUT renders
     // it: in the splat's unit frame, from the camera's origin along the pixel's ray.
-    let unit = transpose(mat3x3<f32>(r[0] / scale.x, r[1] / scale.y, r[2] / scale.z));
-    out.origin = -(unit * t);
-    out.ray = unit * vec3<f32>((pixel - 0.5 * camera.size) / f, 1.0);  // linear across the quad
-    let basis = sh_basis(normalize(world - camera.position.xyz));
+    let unit = transpose(mat3x3<f32>(p.r[0] / p.scale.x, p.r[1] / p.scale.y, p.r[2] / p.scale.z));
+    out.origin = -(unit * p.t);
+    out.ray = unit * vec3<f32>((pixel - 0.5 * camera.size) / camera.focal, 1.0);  // linear
+    let basis = sh_basis(normalize(splat_position(index) - camera.position.xyz));
     let rgb = vec3<f32>(
         sh_channel(0u, index, basis), sh_channel(1u, index, basis), sh_channel(2u, index, basis)
     );
-    out.color = vec4<f32>(max(rgb + 0.5, vec3<f32>(0.0)), szo.y);
+    out.color = vec4<f32>(max(rgb + 0.5, vec3<f32>(0.0)), p.opacity);
     return out;
 }
 
@@ -177,7 +226,156 @@ fn fs_main(in: Varyings) -> @location(0) vec4<f32> {
     if alpha < 1.0 / 255.0 { discard; }
     return vec4<f32>(in.color.rgb * alpha, alpha);  // premultiplied, blended far to near
 }
-""".replace("QUAD_SIGMAS", f"{QUAD_SIGMAS:.1f}").replace("MIN_PIXEL_RADIUS", f"{MIN_PIXEL_RADIUS}")
+"""
+
+# The splats in view sorted far to near on the GPU, by a 16-bit depth key across their depth range
+# (a counting sort: cull, then a histogram of the keys, its prefix sum, and a scatter), so the CPU
+# never touches a splat; the draw's instance count is written there too. Splats with one key (in a
+# house, ~0.2 mm apart in depth) are drawn in no set order among themselves.
+SORT_SHADER = """
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var<storage, read> splats: array<u32>;
+@group(0) @binding(2) var<storage, read> reach: array<f32>;  // metres, of each splat's quad
+@group(0) @binding(3) var<storage, read_write> keys: array<u32>;  // depth bits, then the key
+// The depth range in view, as f32 bits (positive, so ordered as u32): the most of the bits
+// inverted (the least depth), and the most of the bits.
+@group(0) @binding(4) var<storage, read_write> range: array<atomic<u32>, 2>;
+@group(0) @binding(5) var<storage, read_write> bins: array<atomic<u32>, KEYS>;
+@group(0) @binding(6) var<storage, read_write> order: array<u32>;
+@group(0) @binding(7) var<storage, read_write> draw: array<u32, 4>;  // vertices, instances, 0, 0
+
+const CULLED = 0xffffffffu;
+const KEYS = DEPTH_LEVELSu + 1u;
+var<workgroup> least: atomic<u32>;
+var<workgroup> most: atomic<u32>;
+var<workgroup> sums: array<u32, 256>;
+
+fn splat(id: vec3<u32>, groups: vec3<u32>) -> u32 {
+    return id.y * groups.x * 256u + id.x;
+}
+
+// Those between the near and far planes whose quads reach the image.
+@compute @workgroup_size(256)
+fn cull(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+    @builtin(local_invocation_index) local: u32,
+) {
+    if local == 0u { atomicStore(&least, 0u); atomicStore(&most, 0u); }
+    workgroupBarrier();
+    let index = splat(id, groups);
+    if index < camera.count {
+        var key = CULLED;
+        let depth = optical(index).z;
+        if depth > camera.near && depth - reach[index] < camera.far && on_screen(footprint(index)) {
+            key = bitcast<u32>(depth);
+            atomicMax(&least, ~key);
+            atomicMax(&most, key);
+        }
+        keys[index] = key;
+    }
+    workgroupBarrier();
+    if local == 0u {
+        atomicMax(&range[0], atomicLoad(&least));
+        atomicMax(&range[1], atomicLoad(&most));
+    }
+}
+
+@compute @workgroup_size(256)
+fn histogram(
+    @builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>
+) {
+    let index = splat(id, groups);
+    if index >= camera.count || keys[index] == CULLED { return; }
+    let low = bitcast<f32>(~atomicLoad(&range[0]));
+    let high = bitcast<f32>(atomicLoad(&range[1]));
+    let scaled = (high - bitcast<f32>(keys[index])) * (f32(DEPTH_LEVELSu) / max(high - low, 1e-6));
+    let key = min(u32(scaled), DEPTH_LEVELSu);
+    keys[index] = key;
+    atomicAdd(&bins[key], 1u);
+}
+
+// One workgroup: each bin's count becomes where its run starts.
+@compute @workgroup_size(256)
+fn scan(@builtin(local_invocation_index) local: u32) {
+    let per = KEYS / 256u;
+    var total = 0u;
+    for (var k = 0u; k < per; k++) { total += atomicLoad(&bins[local * per + k]); }
+    sums[local] = total;
+    workgroupBarrier();
+    for (var step = 1u; step < 256u; step *= 2u) {
+        var add = 0u;
+        if local >= step { add = sums[local - step]; }
+        workgroupBarrier();
+        sums[local] += add;
+        workgroupBarrier();
+    }
+    var start = sums[local] - total;
+    for (var k = 0u; k < per; k++) {
+        let count = atomicLoad(&bins[local * per + k]);
+        atomicStore(&bins[local * per + k], start);
+        start += count;
+    }
+    if local == 255u {
+        draw[0] = 4u;
+        draw[1] = sums[255];
+        draw[2] = 0u;
+        draw[3] = 0u;
+    }
+}
+
+@compute @workgroup_size(256)
+fn scatter(
+    @builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>
+) {
+    let index = splat(id, groups);
+    if index >= camera.count || keys[index] == CULLED { return; }
+    order[atomicAdd(&bins[keys[index]], 1u)] = index;
+}
+"""
+
+# The blended frame (rgba16float) to the published image's bytes, RGB8 row-major, on the GPU: each
+# invocation packs 4 pixels (12 bytes) into 3 words, rounded as numpy's clip(255 c + 0.5).
+PACK_SHADER = """
+@group(0) @binding(0) var frame: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> rgb: array<u32>;
+
+fn pixel(index: u32, size: vec2<u32>) -> vec4<u32> {
+    if index >= size.x * size.y { return vec4<u32>(0u); }
+    let value = textureLoad(frame, vec2<u32>(index % size.x, index / size.x), 0);
+    return vec4<u32>(clamp(value * 255.0 + 0.5, vec4<f32>(0.0), vec4<f32>(255.0)));
+}
+
+@compute @workgroup_size(256)
+fn pack(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let size = textureDimensions(frame);
+    let quad = id.y * groups.x * 256u + id.x;
+    if quad * 4u >= size.x * size.y { return; }
+    let a = pixel(quad * 4u, size);
+    let b = pixel(quad * 4u + 1u, size);
+    let c = pixel(quad * 4u + 2u, size);
+    let d = pixel(quad * 4u + 3u, size);
+    rgb[quad * 3u] = a.r | (a.g << 8u) | (a.b << 16u) | (b.r << 24u);
+    rgb[quad * 3u + 1u] = b.g | (b.b << 8u) | (c.r << 16u) | (c.g << 24u);
+    rgb[quad * 3u + 2u] = c.b | (d.r << 8u) | (d.g << 16u) | (d.b << 24u);
+}
+"""
+
+
+def _wgsl(code: str) -> str:
+    return (
+        (COMMON + code)
+        .replace("QUAD_SIGMAS", f"{QUAD_SIGMAS:.1f}")
+        .replace("MIN_PIXEL_RADIUS", f"{MIN_PIXEL_RADIUS}")
+        .replace("DEPTH_LEVELS", str(DEPTH_LEVELS))
+    )
+
+
+def _workgroups(invocations: int) -> tuple[int, int]:
+    """Workgroups of 256 for *invocations*, as x by y: no dimension may pass 65535."""
+    groups = max(1, math.ceil(invocations / 256))
+    x = min(groups, 65535)
+    return x, math.ceil(groups / x)
 
 
 @dataclass
@@ -446,7 +644,8 @@ def _packed_splats(splats: Splats) -> NDArray[np.uint32]:
 class SplatRenderer:
     """Draws *splats*, and *people* people among them, from a camera pose: position, forward and up
     in the world frame. Each person is opaque round splats (people.splats), sorted with the
-    scene's, so a wall hides whoever is behind it."""
+    scene's, so a wall hides whoever is behind it. All of a frame's work is on the GPU (sorting
+    the splats, drawing them, and packing the image's bytes); the CPU only reads the bytes back."""
 
     def __init__(self, splats: Splats, config: CameraConfig, people: int = 0) -> None:
         import wgpu  # type: ignore[import-untyped]
@@ -459,9 +658,9 @@ class SplatRenderer:
             hidden = np.float32([0.0, 0.0, -100.0])  # out of sight until placed
             splats = _concatenated([splats, *(splats_of(p + hidden, c) for p, c in self._people)])
         self._config = config
-        self._positions = splats.positions.copy()
-        # How far each splat's quad can reach, metres, for culling it against the view.
-        self._reach = QUAD_SIGMAS * np.exp(splats.log_scales.astype(np.float32).max(axis=1))
+        self._count = len(splats)
+        # How far each splat's quad can reach, metres, for culling it against the far plane.
+        reach = QUAD_SIGMAS * np.exp(splats.log_scales.astype(np.float32).max(axis=1))
         self._focal = focal_length(config)
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
         packed = _packed_splats(splats)
@@ -484,16 +683,23 @@ class SplatRenderer:
         )
         storage = wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST
 
-        def buffer(data: NDArray[np.uint32]) -> object:
+        def buffer(data: NDArray[np.generic]) -> object:
             gpu = device.create_buffer(size=max(data.nbytes, 16), usage=storage)
             device.queue.write_buffer(gpu, 0, data)
             return gpu
 
+        def scratch(size: int, usage: int = 0) -> object:
+            return device.create_buffer(size=max(size, 16), usage=storage | usage)
+
         self._camera = device.create_buffer(
-            size=96, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
+            size=112, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
         )
-        self._order = device.create_buffer(size=max(4 * len(splats), 16), usage=storage)
-        module = device.create_shader_module(code=SHADER)
+        self._order = scratch(4 * len(splats))
+        self._range = scratch(8)
+        self._bins = scratch(4 * (DEPTH_LEVELS + 1))
+        self._draw = scratch(16, wgpu.BufferUsage.INDIRECT)
+        self._splats = buffer(packed)
+        module = device.create_shader_module(code=_wgsl(SHADER))
         self._pipeline = device.create_render_pipeline(
             layout="auto",
             vertex={"module": module, "entry_point": "vs_main"},
@@ -518,7 +724,6 @@ class SplatRenderer:
                 ],
             },
         )
-        self._splats = buffer(packed)
         resources = [self._camera, self._order, self._splats, *(buffer(c) for c in channels)]
         self._bindings = device.create_bind_group(
             layout=self._pipeline.get_bind_group_layout(0),
@@ -527,41 +732,87 @@ class SplatRenderer:
                 for i, b in enumerate(resources)
             ],
         )
+
+        # The sort's four passes share one layout.
+        sorting = [
+            self._camera,
+            self._splats,
+            buffer(reach),
+            scratch(4 * len(splats)),  # keys
+            self._range,
+            self._bins,
+            self._order,
+            self._draw,
+        ]
+        kinds = ["uniform", "read-only-storage", "read-only-storage"] + ["storage"] * 5
+        layout = device.create_bind_group_layout(
+            entries=[
+                {"binding": i, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": kind}}
+                for i, kind in enumerate(kinds)
+            ]
+        )
+        sort_module = device.create_shader_module(code=_wgsl(SORT_SHADER))
+        pipeline_layout = device.create_pipeline_layout(bind_group_layouts=[layout])
+        self._sort = [
+            device.create_compute_pipeline(
+                layout=pipeline_layout, compute={"module": sort_module, "entry_point": name}
+            )
+            for name in ("cull", "histogram", "scan", "scatter")
+        ]
+        self._sort_bindings = device.create_bind_group(
+            layout=layout,
+            entries=[
+                {"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}}
+                for i, b in enumerate(sorting)
+            ],
+        )
+        self._splat_workgroups = _workgroups(len(splats))
+
         self._target = device.create_texture(
             size=(config.width, config.height, 1),
             format=wgpu.TextureFormat.rgba16float,
-            usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_SRC,
+            usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.TEXTURE_BINDING,
         )
         self._view = self._target.create_view()
         background = config.background.lstrip("#")
         self._background = [int(background[i : i + 2], 16) / 255 for i in (0, 2, 4)]
 
-    def visible_order(
-        self, position: NDArray[np.float64], forward: NDArray[np.float64]
-    ) -> NDArray[np.uint32]:
-        """The splats between the near and far planes, far to near. Those off to the side are
-        culled on the GPU: the depth is all the CPU can afford per splat."""
-        cfg = self._config
-        depth = self._positions @ forward.astype(np.float32) - np.float32(position @ forward)
-        visible = (depth > cfg.near) & (depth - self._reach < cfg.far)
-        index = np.flatnonzero(visible)
-        if not len(index):
-            return index.astype(np.uint32)
-        depth = depth[index]
-        low, high = float(depth.min()), float(depth.max())
-        key = ((high - depth) * (DEPTH_LEVELS / max(high - low, 1e-6))).astype(np.uint16)
-        return index[np.argsort(key, kind="stable")].astype(np.uint32)
+        quads = math.ceil(config.width * config.height / 4)  # 4 pixels, 3 words of RGB each
+        self._pack = device.create_compute_pipeline(
+            layout="auto",
+            compute={
+                "module": device.create_shader_module(code=PACK_SHADER),
+                "entry_point": "pack",
+            },
+        )
+        rgb = scratch(12 * quads, wgpu.BufferUsage.COPY_SRC)
+        # One frame can be read back while the next is drawn (submit, then collect).
+        self._readbacks = [
+            device.create_buffer(
+                size=rgb.size, usage=wgpu.BufferUsage.MAP_READ | wgpu.BufferUsage.COPY_DST
+            )
+            for _ in range(FRAMES_IN_FLIGHT)
+        ]
+        self._in_flight: deque[tuple[Any, Any]] = deque()  # readback buffers, being mapped
+        self._pack_bindings = device.create_bind_group(
+            layout=self._pack.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": self._view},
+                {"binding": 1, "resource": {"buffer": rgb, "offset": 0, "size": rgb.size}},
+            ],
+        )
+        self._rgb = rgb
+        self._pack_workgroups = _workgroups(quads)
 
     def place_people(self, poses: NDArray[np.float64]) -> None:
         """Moves each person's splats to their pose: x, y, yaw."""
         if not self._people:
             return
-        start = self._scene_count
+        start = 0
         for (local, _), (x, y, yaw) in zip(self._people, poses, strict=True):
             world = local @ yaw_rotation(yaw).T.astype(np.float32) + np.float32([x, y, 0.0])
-            self._positions[start : start + len(local)] = world
+            self._people_packed[start : start + len(local), :3] = world.view(np.uint32)
             start += len(local)
-        self._people_packed[:, :3] = self._positions[self._scene_count :].view(np.uint32)
         self._device.queue.write_buffer(self._splats, self._scene_count * 32, self._people_packed)
 
     def capture(
@@ -571,6 +822,20 @@ class SplatRenderer:
         up: NDArray[np.float64],
         people: NDArray[np.float64] | None = None,
     ) -> NDArray[np.uint8]:
+        self.submit(position, forward, up, people)
+        return self.collect()
+
+    def submit(
+        self,
+        position: NDArray[np.float64],
+        forward: NDArray[np.float64],
+        up: NDArray[np.float64],
+        people: NDArray[np.float64] | None = None,
+    ) -> None:
+        """Starts drawing the view from *position*; collect() returns it. Up to FRAMES_IN_FLIGHT
+        can be drawing at once: the GPU runs them in order."""
+        if len(self._in_flight) == len(self._readbacks):
+            raise RuntimeError("collect a frame before submitting another")
         import wgpu
 
         if people is not None:
@@ -581,18 +846,30 @@ class SplatRenderer:
         right /= np.linalg.norm(right)
         down = np.cross(forward, right)
         rotation = np.stack([right, down, forward])  # world to optical
-        order = self.visible_order(position, forward)
-        uniform = np.zeros(24, np.float32)
+        uniform = np.zeros(28, np.float32)
         matrix = np.eye(4, dtype=np.float32)
         matrix[:3, :3] = rotation
         uniform[:16] = matrix.T.ravel()  # WGSL matrices are column-major
         uniform[16:19] = position
-        uniform[20:24] = (self._focal, self._focal, cfg.width, cfg.height)
+        uniform[20:26] = (self._focal, self._focal, cfg.width, cfg.height, cfg.near, cfg.far)
+        uniform[26:27] = np.uint32(self._count).view(np.float32)
         queue = self._device.queue
         queue.write_buffer(self._camera, 0, uniform)
-        if len(order):
-            queue.write_buffer(self._order, 0, order)
         encoder = self._device.create_command_encoder()
+        encoder.clear_buffer(self._range)
+        encoder.clear_buffer(self._bins)
+        sorting = encoder.begin_compute_pass()
+        sorting.set_bind_group(0, self._sort_bindings)
+        cull, histogram, scan, scatter = self._sort
+        for pipeline, workgroups in [
+            (cull, self._splat_workgroups),
+            (histogram, self._splat_workgroups),
+            (scan, (1, 1)),
+            (scatter, self._splat_workgroups),
+        ]:
+            sorting.set_pipeline(pipeline)
+            sorting.dispatch_workgroups(*workgroups)
+        sorting.end()
         rendering = encoder.begin_render_pass(
             color_attachments=[
                 {
@@ -605,15 +882,28 @@ class SplatRenderer:
         )
         rendering.set_pipeline(self._pipeline)
         rendering.set_bind_group(0, self._bindings)
-        if len(order):
-            rendering.draw(4, len(order))
+        rendering.draw_indirect(self._draw, 0)
         rendering.end()
+        packing = encoder.begin_compute_pass()
+        packing.set_pipeline(self._pack)
+        packing.set_bind_group(0, self._pack_bindings)
+        packing.dispatch_workgroups(*self._pack_workgroups)
+        packing.end()
+        readback = next(b for b in self._readbacks if all(b is not f for f, _ in self._in_flight))
+        encoder.copy_buffer_to_buffer(self._rgb, 0, readback, 0, self._rgb.size)
         queue.submit([encoder.finish()])
-        raw = queue.read_texture(
-            {"texture": self._target, "origin": (0, 0, 0), "mip_level": 0},
-            {"offset": 0, "bytes_per_row": cfg.width * 8, "rows_per_image": cfg.height},
-            (cfg.width, cfg.height, 1),
-        )
-        rgba = np.frombuffer(raw, np.float16).reshape(cfg.height, cfg.width, 4)
-        rgb = np.clip(rgba[:, :, :3].astype(np.float32) * 255 + 0.5, 0, 255)
-        return rgb.astype(np.uint8)
+        # Mapped now, not on collect: wgpu's poll waits on everything submitted when it starts,
+        # so a map asked for after the next frame's submit would wait for that frame too.
+        self._in_flight.append((readback, readback.map_async(wgpu.MapMode.READ)))
+
+    def collect(self) -> NDArray[np.uint8]:
+        """The earliest submitted frame not yet collected, RGB, once the GPU has drawn it."""
+        cfg = self._config
+        readback, mapped = self._in_flight.popleft()
+        mapped.sync_wait()
+        try:
+            raw = readback.read_mapped(copy=False)
+            size = cfg.width * cfg.height * 3
+            return np.frombuffer(raw, np.uint8, size).reshape(cfg.height, cfg.width, 3).copy()
+        finally:
+            readback.unmap()

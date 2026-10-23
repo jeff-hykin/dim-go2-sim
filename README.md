@@ -31,7 +31,7 @@ python examples/drive.py
 ```
 
 The first run downloads and cooks the scan (31 MB, under a minute). Then the sim publishes lidar at
-10 Hz, the nose camera at ~9 fps on an M-series Mac, odom at 50 Hz and tf over zenoh, and walks
+10 Hz, the nose camera at 1920x1080 and 20 Hz, odom at 50 Hz and tf over zenoh, and walks
 wherever `cmd_vel` says: drive it from dimOS Desktop's Controller app, or add a planner or teleop
 module to the blueprint with `autoconnect`.
 
@@ -185,8 +185,12 @@ See `src/dim_go2_sim/config.py` for what each means and its default.
   halves larger ones until they fit.
 - **Splat camera.** Gaussian splats are drawn with wgpu (Metal, Vulkan or lavapipe), sorted far
   to near each frame, each pixel's ray evaluated against the splat in 3D as 3DGUT (which made
-  the InteriorGS splats) renders it, with degree-3 spherical harmonics. An InteriorGS home (1.2M
-  splats) at 640x480: ~25 fps on an M-series Mac, ~45 on an RTX 5070 laptop, ~2 on lavapipe.
+  the InteriorGS splats) renders it, with degree-3 spherical harmonics. A frame is all GPU work:
+  the splats in view are culled and counting-sorted by depth in compute passes, drawn, and packed
+  into the published RGB bytes; one frame is read back while the next is drawn. The NJ ranch
+  scan (2.7M splats) at the default 1920x1080 takes 7-21 ms of GPU time a frame on an M5 Max
+  (sort ~1 ms), well inside the default 20 Hz. On a software GPU (lavapipe), set a smaller
+  `camera.width` and `camera.height` (640x480 ran ~2 fps there).
 - **InteriorGS collisions.** MuJoCo collides only with convex shapes and the homes' meshes are
   open surfaces, so they are voxelised at 5 cm up to 2 m above the floor and the voxels merged
   into boxes (a few thousand per home); the floor is a plane. The lidar casts against the
